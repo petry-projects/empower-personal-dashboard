@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `CHANGELOG.md` documenting historical and current releases.
 - Registered `Changelog` URL under `[project.urls]` in `pyproject.toml` so PyPI displays a direct release notes link in the project sidebar.
 - Added packaging unit tests in `tests/test_packaging.py` validating `CHANGELOG.md` presence, structure, and `Changelog` project URL registration.
-- Added Beancount export enhancements: Fava inversion option (`--fava-inversion`) and baseline opening date for holdings (`--holdings-open-date`).
+- Added Beancount export enhancements: enabled Fava inversion in generated ledgers and added a baseline opening date option for holdings (`--opening-date`).
 
 ### Changed
 - Updated documentation (`README.md` and `AGENTS.md`) with Changelog links and architecture references.
