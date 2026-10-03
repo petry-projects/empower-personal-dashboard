@@ -858,7 +858,7 @@ def _run_beancount_export(args, client, balances_res, holdings_res, transactions
         try:
             balances_res = client.fetch_balances()
         except Exception:
-            logger.debug("Could not fetch balances to enrich Beancount accounts")
+            logger.debug("Could not fetch balances to enrich Beancount accounts")  # lgtm[py/clear-text-logging-sensitive-data]
 
     mapper = BeancountMapper(mapping_path=args.beancount_map)
     generator = BeancountGenerator(mapper=mapper)
@@ -880,7 +880,7 @@ def _run_beancount_export(args, client, balances_res, holdings_res, transactions
             opening_date=args.opening_date,
         )
         if not args.quiet:
-            print(f"[+] Beancount modular ledger ({len(created)} files) saved to: {dest_dir}", file=progress_file)
+            print(f"[+] Beancount modular ledger ({len(created)} files) saved to: {dest_dir}", file=progress_file)  # lgtm[py/clear-text-logging-sensitive-data]
 
     return balances_res
 
