@@ -277,6 +277,56 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertNotIn("startDate", payload)
         self.assertEqual(txs.start_date, "2018-05-12")
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_live_mocked(self, mock_post):
+        from empower_personal_dashboard.models import DashboardHistories
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-31",
+                "histories": [
+                    {
+                        "date": "2024-01-01",
+                        "totalAssets": 150000.0,
+                        "totalLiabilities": 5000.0,
+                        "netWorth": 145000.0,
+                        "balances": {
+                            "ACC-INV-001": 120000.0,
+                            "ACC-CHK-002": 30000.0,
+                            "ACC-CRD-003": -5000.0,
+                        },
+                    },
+                    {
+                        "date": "2024-01-15",
+                        "totalAssets": 155000.0,
+                        "totalLiabilities": 4500.0,
+                        "netWorth": 150500.0,
+                        "balances": {
+                            "ACC-INV-001": 124000.0,
+                            "ACC-CHK-002": 31000.0,
+                            "ACC-CRD-003": -4500.0,
+                        },
+                    },
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-31")
+        self.assertIsInstance(histories, DashboardHistories)
+        self.assertEqual(histories.total_points, 2)
+        self.assertEqual(histories.histories[0]["date"], "2024-01-01")
+        self.assertEqual(histories.histories[0]["net_worth"], 145000.0)
+        self.assertEqual(histories.histories[1]["balances"]["ACC-INV-001"], 124000.0)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["startDate"], "2024-01-01")
+        self.assertEqual(kwargs["data"]["endDate"], "2024-01-31")
+
 
 class TestClientMockMode(unittest.TestCase):
     def test_offline_sandbox_mock_generators(self):
@@ -295,6 +345,11 @@ class TestClientMockMode(unittest.TestCase):
         txs = client.fetch_transactions()
         self.assertEqual(txs.mode, "sandbox_mock")
         self.assertGreater(txs.total_transactions, 0)
+
+        histories = client.fetch_histories()
+        self.assertEqual(histories.mode, "sandbox_mock")
+        self.assertGreater(histories.total_points, 0)
+        self.assertGreater(histories.histories[0]["net_worth"], 0)
 
     def test_mock_transactions_start_date_reflects_oldest_mock(self):
         client = EmpowerDashboardClient(mock_mode=True)

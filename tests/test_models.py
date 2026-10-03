@@ -100,6 +100,39 @@ class TestModels(unittest.TestCase):
         dtd = dt.to_dict()
         self.assertEqual(dtd["net_cashflow"], -4.75)
 
+    def test_histories_model(self):
+        from empower_personal_dashboard.models import DailyHistoryPoint, DashboardHistories
+
+        pt = DailyHistoryPoint(
+            date="2024-01-15",
+            net_worth=125000.50,
+            total_assets=135000.50,
+            total_liabilities=10000.00,
+            balances={"ACC-INV-001": 100000.0, "ACC-CHK-002": 35000.50, "ACC-CRD-003": -10000.0},
+        )
+        d = pt.to_dict()
+        self.assertEqual(d["date"], "2024-01-15")
+        self.assertEqual(d["net_worth"], 125000.50)
+        self.assertEqual(d["total_assets"], 135000.50)
+        self.assertEqual(d["total_liabilities"], 10000.00)
+        self.assertEqual(d["balances"]["ACC-INV-001"], 100000.0)
+
+        histories = DashboardHistories(
+            start_date="2024-01-01",
+            end_date="2024-01-31",
+            histories=[d],
+            total_points=1,
+            mode="live",
+        )
+        hd = histories.to_dict()
+        self.assertEqual(hd["start_date"], "2024-01-01")
+        self.assertEqual(hd["total_points"], 1)
+        self.assertEqual(len(hd["histories"]), 1)
+
+        restored = DashboardHistories.from_dict(hd)
+        self.assertEqual(restored.start_date, "2024-01-01")
+        self.assertEqual(restored.total_points, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

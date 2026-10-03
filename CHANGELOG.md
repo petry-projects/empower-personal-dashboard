@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Reconstruct investment growth curve and multi-year trade timeline in Beancount export ([#38](https://github.com/petry-projects/empower-personal-dashboard/issues/38)):
+  - Formatted investment trades (`Buy`, `Sell`, `Reinvest`, `Dividend Received`) into double-entry transactions with commodity lot pricing, cash settlement legs, and capital gains tracking.
+  - Implemented pre-history baseline lot reconciliation: `Baseline Opening Qty = Current Snapshot Qty - Net Buys`. Emits opening lots in `holdings.bean` only when positive, avoiding duplicate shares for positions acquired within the transaction window.
+  - Added `fetch_histories(start_date, end_date, user_account_ids)` to `EmpowerDashboardClient` with support for `/account/getHistories` RPC and synthetic offline sandbox simulation.
+  - Added `DailyHistoryPoint` and `DashboardHistories` domain models and wire schemas to OpenAPI 3.1 specification with contract tests.
+
 ## [0.1.2] - 2026-10-03
 
 ### Added

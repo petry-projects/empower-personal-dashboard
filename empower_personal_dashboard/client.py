@@ -26,6 +26,7 @@ from .exceptions import (
 )
 from .models import (
     DashboardBalances,
+    DashboardHistories,
     DashboardHoldings,
     DashboardTransactions,
 )
@@ -648,6 +649,81 @@ class EmpowerDashboardClient:
             raw_response=result,
         )
 
+    def fetch_histories(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        user_account_ids: Optional[Any] = None,
+    ) -> DashboardHistories:
+        """Fetch historical daily balance and net worth curve directly from Empower."""
+        if self.mock_mode:
+            return self._generate_mock_histories(start_date=start_date, end_date=end_date)
+
+        payload: Dict[str, Any] = {}
+        if start_date:
+            payload["startDate"] = start_date
+        if end_date:
+            payload["endDate"] = end_date
+        if user_account_ids is not None:
+            payload["userAccountIds"] = user_account_ids
+
+        try:
+            result = self.fetch("/account/getHistories", data=payload)
+        except SessionExpiredError:
+            raise
+        except Exception as e:
+            raise EmpowerError(f"Failed to fetch account histories from dashboard: {e}") from e
+
+        sp_data = result.get("spData", {})
+        resp_start = sp_data.get("startDate") or start_date or ""
+        resp_end = sp_data.get("endDate") or end_date or ""
+        raw_hist = sp_data.get("histories", [])
+
+        normalized_histories = []
+        for entry in raw_hist:
+            date_str = str(entry.get("date") or "")
+            if not date_str:
+                continue
+
+            total_assets = entry.get("totalAssets")
+            if total_assets is None:
+                total_assets = entry.get("aggregateBalance")
+
+            raw_balances = entry.get("balances", {})
+            clean_balances: Dict[str, float] = {}
+            if isinstance(raw_balances, dict):
+                for k, v in raw_balances.items():
+                    if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
+                        clean_balances[str(k)] = float(v)
+
+            if total_assets is None and clean_balances:
+                total_assets = sum(clean_balances.values())
+
+            total_assets_val = float(total_assets or 0.0)
+            total_liab_val = float(entry.get("totalLiabilities") or 0.0)
+            net_worth_val = (
+                float(entry.get("netWorth"))
+                if entry.get("netWorth") is not None
+                else (total_assets_val - abs(total_liab_val))
+            )
+
+            normalized_histories.append({
+                "date": date_str,
+                "net_worth": net_worth_val,
+                "total_assets": total_assets_val,
+                "total_liabilities": total_liab_val,
+                "balances": clean_balances,
+            })
+
+        return DashboardHistories(
+            start_date=resp_start,
+            end_date=resp_end,
+            total_points=len(normalized_histories),
+            histories=normalized_histories,
+            mode="live",
+            raw_response=result,
+        )
+
     # --------------------------------------------------------------------------
     # Synthetic Benchmark Mock Generators (100% PII-Free)
     # --------------------------------------------------------------------------
@@ -927,3 +1003,63 @@ class EmpowerDashboardClient:
             transactions=mock_txs,
             mode="sandbox_mock",
         )
+
+    def _generate_mock_histories(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> DashboardHistories:
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        start = start_date or "2024-01-01"
+        end = end_date or today_str
+
+        mock_histories = [
+            {
+                "date": f"{start[:4]}-01-01",
+                "net_worth": 485000.0,
+                "total_assets": 487500.0,
+                "total_liabilities": 2500.0,
+                "balances": {
+                    "ACC-INV-001": 310000.0,
+                    "ACC-IRA-002": 115000.0,
+                    "ACC-CHK-003": 20000.0,
+                    "ACC-SAV-004": 42500.0,
+                    "ACC-CRD-005": -2500.0,
+                },
+            },
+            {
+                "date": f"{start[:4]}-06-01",
+                "net_worth": 512000.0,
+                "total_assets": 514200.0,
+                "total_liabilities": 2200.0,
+                "balances": {
+                    "ACC-INV-001": 330000.0,
+                    "ACC-IRA-002": 120000.0,
+                    "ACC-CHK-003": 22000.0,
+                    "ACC-SAV-004": 42200.0,
+                    "ACC-CRD-005": -2200.0,
+                },
+            },
+            {
+                "date": end,
+                "net_worth": 552050.0,
+                "total_assets": 554500.0,
+                "total_liabilities": 2450.0,
+                "balances": {
+                    "ACC-INV-001": 350000.0,
+                    "ACC-IRA-002": 125000.0,
+                    "ACC-CHK-003": 24500.0,
+                    "ACC-SAV-004": 55000.0,
+                    "ACC-CRD-005": -2450.0,
+                },
+            },
+        ]
+
+        return DashboardHistories(
+            start_date=start,
+            end_date=end,
+            total_points=len(mock_histories),
+            histories=mock_histories,
+            mode="sandbox_mock",
+        )
+

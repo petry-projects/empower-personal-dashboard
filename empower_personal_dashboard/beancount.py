@@ -514,7 +514,9 @@ class BeancountGenerator:
             "2000-01-01 open Equity:Opening-Balances USD\n"
             "2000-01-01 open Equity:Transfers USD\n"
             "2000-01-01 open Expenses:Uncategorized USD\n"
-            "2000-01-01 open Income:Uncategorized USD\n\n"
+            "2000-01-01 open Income:Uncategorized USD\n"
+            "2000-01-01 open Income:CapitalGains\n"
+            "2000-01-01 open Income:Dividends USD\n\n"
             ";; Linked Institution Accounts & Pads\n"
         ]
 
@@ -523,6 +525,8 @@ class BeancountGenerator:
             "Equity:Transfers",
             "Expenses:Uncategorized",
             "Income:Uncategorized",
+            "Income:CapitalGains",
+            "Income:Dividends",
         }
         acct_lookup = _build_account_lookup(balances)
 
@@ -773,6 +777,7 @@ class BeancountGenerator:
         self,
         holdings: Optional[DashboardHoldings] = None,
         balances: Optional[DashboardBalances] = None,
+        transactions: Optional[DashboardTransactions] = None,
         existing_content: Optional[str] = None,
         opening_date: Optional[str] = None,
     ) -> str:
@@ -787,8 +792,9 @@ class BeancountGenerator:
             return "".join(lines)
 
         as_of = holdings.as_of_date
-        if opening_date:
-            lot_date = opening_date
+        effective_opening = opening_date or _determine_opening_date(transactions, balances, None)
+        if effective_opening:
+            lot_date = effective_opening
         else:
             # Date holdings snapshot transaction before the balance assertion date so Beancount's
             # beginning-of-day balance assertion on as_of passes cleanly.
@@ -804,6 +810,47 @@ class BeancountGenerator:
         existing_keys: Set[str] = set()
         if existing_content:
             existing_keys = set(re.findall(r'empower_holding:\s*"([^"]+)"', existing_content))
+
+        # Calculate net transaction buys per (b_account, ticker) across the transaction history
+        net_buys: Dict[Tuple[str, str], float] = {}
+        if transactions and transactions.transactions:
+            for tx in transactions.transactions:
+                sym = tx.get("symbol")
+                if not sym:
+                    continue
+                t_ticker = _clean_ticker(sym)
+                if not t_ticker:
+                    continue
+
+                tx_raw_qty = tx.get("quantity")
+                tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
+                if tx_qty <= 0:
+                    continue
+
+                aid = str(tx.get("account_id") or "")
+                uaid = str(tx.get("user_account_id") or "")
+                t_name = tx.get("account_name") or ""
+                acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
+                if acct_info:
+                    tx_firm = acct_info.get("firm_name") or "Brokerage"
+                    tx_acct_name = acct_info.get("account_name") or t_name or "Brokerage"
+                    tx_acct_type = acct_info.get("account_type") or "investment"
+                    tx_aid = str(acct_info.get("account_id") or aid)
+                else:
+                    tx_firm = tx.get("firm_name") or "Brokerage"
+                    tx_acct_name = t_name or "Brokerage"
+                    tx_acct_type = tx.get("account_type") or "investment"
+                    tx_aid = aid
+
+                tx_b_account = self.mapper.resolve_account(tx_firm, tx_acct_name, tx_aid, account_type=tx_acct_type)
+                tx_type = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+                inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
+
+                key = (tx_b_account, t_ticker)
+                if tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest"):
+                    net_buys[key] = net_buys.get(key, 0.0) + tx_qty
+                elif tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal"):
+                    net_buys[key] = net_buys.get(key, 0.0) - tx_qty
 
         # Aggregate positions by (b_account, ticker) to emit each snapshot position only once
         aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -853,9 +900,20 @@ class BeancountGenerator:
             b_account = pos["b_account"]
             ticker = pos["ticker"]
             firm = pos["firm"]
-            qty = pos["quantity"]
+            snapshot_qty = pos["quantity"]
             price = pos["price"]
             cost_basis = pos["cost_basis"]
+
+            key = (b_account, ticker)
+            if transactions is not None and transactions.transactions:
+                nb = net_buys.get(key, 0.0)
+                baseline_qty = snapshot_qty - nb
+            else:
+                baseline_qty = snapshot_qty
+
+            # If Baseline Opening Qty <= 0: position was acquired entirely within transaction window
+            if baseline_qty <= 0.000001:
+                continue
 
             holding_tag = f"{b_account}:{ticker}"
             if holding_tag in existing_keys:
@@ -866,8 +924,9 @@ class BeancountGenerator:
             lines.append(f'{lot_date} * "{payee_esc}" "{narration_esc}"\n')
             lines.append(f'  empower_holding: "{holding_tag}"\n')
 
-            if cost_basis is not None and float(cost_basis) > 0:
-                unit_cost = float(cost_basis) / qty
+            qty = baseline_qty
+            if cost_basis is not None and float(cost_basis) > 0 and snapshot_qty > 0:
+                unit_cost = float(cost_basis) / snapshot_qty
                 lines.append(
                     f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
                     f"{{{_format_cost(unit_cost)} USD}} @ {_format_price(price)} USD\n"
@@ -925,9 +984,7 @@ class BeancountGenerator:
                 )
 
             date = tx.get("transaction_date") or "2000-01-01"
-            payee = _escape_beancount_string(tx.get("description") or "Unknown Payee")
             cat_name = tx.get("category") or tx.get("category_name")
-            narration = _escape_beancount_string(cat_name or tx.get("original_description") or "")
             amount = abs(float(tx.get("amount") or 0.0))
 
             is_credit = bool(tx.get("is_credit"))
@@ -936,6 +993,100 @@ class BeancountGenerator:
             is_spending = bool(tx.get("is_spending", False))
 
             primary_account = self.mapper.resolve_account(firm, acct_name, resolved_id, acct_type)
+
+            # Investment transaction detection
+            raw_tx_type = tx.get("transaction_type") or ""
+            tx_type_clean = clean_api_text(raw_tx_type).strip().lower()
+            raw_inv_type = tx.get("investment_type") or ""
+            inv_type_clean = clean_api_text(raw_inv_type).strip().lower()
+            cat_clean = clean_api_text(cat_name or "").lower()
+            symbol = tx.get("symbol")
+            ticker = _clean_ticker(symbol)
+            raw_qty = tx.get("quantity")
+            raw_price = tx.get("price")
+
+            qty = abs(float(raw_qty)) if raw_qty is not None else 0.0
+            price = abs(float(raw_price)) if raw_price is not None else 0.0
+
+            link_id = tx_id[3:] if tx_id.startswith("tx-") else tx_id
+            link_id_clean = re.sub(r"[^A-Za-z0-9\-]", "", link_id)
+            tag_str = f" ^empower-tx-{link_id_clean}" if link_id_clean else ""
+
+            is_buy = (
+                (tx_type_clean in ("buy", "reinvest") or inv_type_clean in ("buy", "reinvest"))
+                and bool(ticker)
+                and qty > 0
+            )
+            is_sell = (
+                (tx_type_clean in ("sell", "disposal") or inv_type_clean in ("sell", "disposal"))
+                and bool(ticker)
+                and qty > 0
+            )
+            is_dividend = (
+                "dividend" in tx_type_clean
+                or "dividend" in inv_type_clean
+                or "dividend" in cat_clean
+            )
+
+            # Resolve payee and narration for investment transactions
+            if is_buy or is_sell or is_dividend:
+                if firm and firm != "Institution":
+                    inv_payee = _escape_beancount_string(firm)
+                else:
+                    inv_payee = _escape_beancount_string(tx.get("description") or "Brokerage")
+                inv_narration = _escape_beancount_string(tx.get("description") or "")
+
+                if is_buy:
+                    if price == 0 and amount > 0 and qty > 0:
+                        price = amount / qty
+                    if amount == 0 and price > 0 and qty > 0:
+                        amount = round(qty * price, 2)
+                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
+                    if tx_id:
+                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
+                    if acct_id:
+                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
+                    lines.append(
+                        f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
+                        f"{{{_format_price(price)} USD}}\n"
+                    )
+                    lines.append(f"  {primary_account:<36} {-amount:>8.2f} USD\n\n")
+                    continue
+
+                if is_sell:
+                    if price == 0 and amount > 0 and qty > 0:
+                        price = amount / qty
+                    if amount == 0 and price > 0 and qty > 0:
+                        amount = round(qty * price, 2)
+                    cap_gains_acct = self.mapper.categories.get("Capital Gains") or "Income:CapitalGains"
+                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
+                    if tx_id:
+                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
+                    if acct_id:
+                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
+                    lines.append(
+                        f"  {primary_account:<36} -{_format_quantity(qty)} {ticker} {{}} "
+                        f"@ {_format_price(price)} USD\n"
+                    )
+                    lines.append(f"  {primary_account:<36} {amount:>8.2f} USD\n")
+                    lines.append(f"  {cap_gains_acct}\n\n")
+                    continue
+
+                if is_dividend:
+                    dividend_acct = self.mapper.categories.get("Dividends") or "Income:Dividends"
+                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
+                    if tx_id:
+                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
+                    if acct_id:
+                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
+                    lines.append(f"  {primary_account:<36} {amount:>8.2f} USD\n")
+                    lines.append(f"  {dividend_acct:<36} {-amount:>8.2f} USD\n\n")
+                    continue
+
+            # Standard banking / spending / income transaction
+            payee = _escape_beancount_string(tx.get("description") or "Unknown Payee")
+            narration = _escape_beancount_string(cat_name or tx.get("original_description") or "")
+
             category_account = self.mapper.resolve_category_or_payee(
                 category=cat_name,
                 description=tx.get("description"),
@@ -946,13 +1097,7 @@ class BeancountGenerator:
                 memo=tx.get("original_description"),
             )
 
-            # Determine double-entry posting signs:
-            # - For Liabilities (credit cards, loans):
-            #   Spending/Charges: Liabilities leg is negative (-amount), balancing leg (Expenses) is positive (+amount)
-            #   Credits/Payments: Liabilities leg is positive (+amount), balancing leg (Transfers/Bank) is negative (-amount)
-            # - For Assets (bank, cash):
-            #   Cash in / Income: Assets leg is positive (+amount), balancing leg (Income/Transfers) is negative (-amount)
-            #   Cash out / Spending: Assets leg is negative (-amount), balancing leg (Expenses/Transfers) is positive (+amount)
+            # Determine double-entry posting signs
             is_liability = primary_account.startswith("Liabilities") or (not is_asset)
 
             if is_liability:
@@ -968,11 +1113,6 @@ class BeancountGenerator:
             else:
                 acct_amount = -amount
                 bal_amount = amount
-
-            # Format Beancount transaction block with safe escaping
-            link_id = tx_id[3:] if tx_id.startswith("tx-") else tx_id
-            link_id_clean = re.sub(r"[^A-Za-z0-9\-]", "", link_id)
-            tag_str = f" ^empower-tx-{link_id_clean}" if link_id_clean else ""
 
             lines.append(f'{date} * "{payee}" "{narration}"{tag_str}\n')
             if tx_id:
@@ -1044,6 +1184,7 @@ class BeancountGenerator:
             self.generate_holdings_bean(
                 holdings,
                 balances=balances,
+                transactions=transactions,
                 existing_content=existing_h_text,
                 opening_date=effective_opening_date,
             )
@@ -1147,6 +1288,7 @@ class BeancountGenerator:
                     self.generate_holdings_bean(
                         holdings,
                         balances=balances,
+                        transactions=transactions,
                         existing_content=existing_content,
                         opening_date=effective_opening_date,
                     )
@@ -1193,7 +1335,12 @@ class BeancountGenerator:
             '1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"\n\n',
             self.generate_accounts_bean(balances, holdings, transactions, include_pads=False),
             "\n",
-            self.generate_holdings_bean(holdings, balances=balances, opening_date=effective_opening_date),
+            self.generate_holdings_bean(
+                holdings,
+                balances=balances,
+                transactions=transactions,
+                opening_date=effective_opening_date,
+            ),
             "\n",
             self.generate_balances_bean(balances, holdings, transactions=transactions),
             "\n",

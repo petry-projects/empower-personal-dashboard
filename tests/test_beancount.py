@@ -778,6 +778,390 @@ class TestBeancountGenerator(unittest.TestCase):
         self.assertNotIn("10.000000 AAPL", output)
 
 
+class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
+    """Hermetic unit tests for reconstructing portfolio growth curves from investment transactions."""
+
+    def setUp(self):
+        self.generator = BeancountGenerator()
+
+        # Multi-Year Investment Life-Cycle Fixture (100% Synthetic, PII-Free)
+        # Brokerage Account
+        self.balances = DashboardBalances(
+            as_of_date="2024-10-01",
+            net_worth=21000.0,
+            total_cash=0.0,
+            total_investment=21000.0,
+            total_credit_card=0.0,
+            total_loan=0.0,
+            total_mortgage=0.0,
+            accounts=[
+                {
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "balance": 21000.0,
+                    "is_asset": True,
+                    "currency": "USD",
+                    "user_account_id": 5001,
+                }
+            ],
+        )
+
+        # Snapshot at Year 4 (2024-10-01): 60 VTI @ $280, 15 AAPL @ $220
+        self.holdings_snapshot = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=20100.0,
+            holdings=[
+                {
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "ticker": "VTI",
+                    "quantity": 60.0,
+                    "price": 280.0,
+                    "cost_basis": 12600.0,  # $210 / share average
+                },
+                {
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "ticker": "AAPL",
+                    "quantity": 15.0,
+                    "price": 220.0,
+                    "cost_basis": 2250.0,  # $150 / share
+                },
+            ],
+        )
+
+        # Multi-Year Investment Transactions:
+        # Year 1 (2021-06-15): Buy 20 VTI @ $200 = $4000
+        # Year 2 (2022-03-10): Buy 15 AAPL @ $150 = $2250
+        # Year 3 (2023-08-20): Sell 10 VTI @ $220 = $2200
+        # Year 4 (2024-06-30): Dividend 60 VTI = $45
+        self.transactions_history = DashboardTransactions(
+            start_date="2021-01-01",
+            end_date="2024-10-01",
+            total_transactions=4,
+            money_in=2245.0,
+            money_out=6250.0,
+            net_cashflow=-4005.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-12345",
+                    "account_id": "ACC-BRK-001",
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2021-06-15",
+                    "description": "Buy VTI",
+                    "original_description": "BUY 20 VTI @ 200",
+                    "amount": 4000.0,
+                    "is_credit": False,
+                    "is_cash_in": False,
+                    "is_cash_out": True,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 200.0,
+                    "quantity": 20.0,
+                },
+                {
+                    "user_transaction_id": "tx-23456",
+                    "account_id": "ACC-BRK-001",
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2022-03-10",
+                    "description": "Buy AAPL",
+                    "original_description": "BUY 15 AAPL @ 150",
+                    "amount": 2250.0,
+                    "is_credit": False,
+                    "is_cash_in": False,
+                    "is_cash_out": True,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "AAPL",
+                    "price": 150.0,
+                    "quantity": 15.0,
+                },
+                {
+                    "user_transaction_id": "tx-67890",
+                    "account_id": "ACC-BRK-001",
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2023-08-20",
+                    "description": "Sell VTI",
+                    "original_description": "SELL 10 VTI @ 220",
+                    "amount": 2200.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_cash_out": False,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Sell",
+                    "investment_type": "Sell",
+                    "symbol": "VTI",
+                    "price": 220.0,
+                    "quantity": 10.0,
+                },
+                {
+                    "user_transaction_id": "tx-11223",
+                    "account_id": "ACC-BRK-001",
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-06-30",
+                    "description": "Dividend VTI",
+                    "original_description": "DIVIDEND ON VTI",
+                    "amount": 45.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_cash_out": False,
+                    "is_income": True,
+                    "is_spending": False,
+                    "transaction_type": "Dividend Received",
+                    "investment_type": "Dividend",
+                    "symbol": "VTI",
+                    "price": 0.0,
+                    "quantity": 0.0,
+                },
+            ],
+        )
+
+    def test_accounts_bean_declares_capital_gains_and_dividends(self):
+        output = self.generator.generate_accounts_bean(balances=self.balances, holdings=self.holdings_snapshot)
+        self.assertIn("open Income:CapitalGains", output)
+        self.assertIn("open Income:Dividends USD", output)
+
+    def test_buy_transaction_directive_emits_commodity_and_cash_legs(self):
+        buy_tx = DashboardTransactions(
+            start_date="2024-03-15",
+            end_date="2024-03-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=2205.0,
+            net_cashflow=-2205.0,
+            transactions=[
+                {
+                    "user_transaction_id": "12345",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-03-15",
+                    "description": "Buy VTI",
+                    "amount": 2205.0,
+                    "is_credit": False,
+                    "is_cash_in": False,
+                    "is_cash_out": True,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 220.50,
+                    "quantity": 10.0,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
+        self.assertIn('2024-03-15 * "Acme Brokerage" "Buy VTI" ^empower-tx-12345', output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  10.000000 VTI {220.5000 USD}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage -2205.00 USD", output)
+        self.assertNotIn("Expenses:Uncategorized", output)
+
+    def test_sell_transaction_directive_emits_disposal_and_capital_gains(self):
+        sell_tx = DashboardTransactions(
+            start_date="2025-06-20",
+            end_date="2025-06-20",
+            total_transactions=1,
+            money_in=1250.0,
+            money_out=0.0,
+            net_cashflow=1250.0,
+            transactions=[
+                {
+                    "user_transaction_id": "67890",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2025-06-20",
+                    "description": "Sell VTI",
+                    "amount": 1250.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_cash_out": False,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Sell",
+                    "symbol": "VTI",
+                    "price": 250.0,
+                    "quantity": 5.0,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(sell_tx, balances=self.balances)
+        self.assertIn('2025-06-20 * "Acme Brokerage" "Sell VTI" ^empower-tx-67890', output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage -5.000000 VTI {} @ 250.0000 USD", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  1250.00 USD", output)
+        self.assertIn("Income:CapitalGains", output)
+
+    def test_dividend_transaction_directive(self):
+        div_tx = DashboardTransactions(
+            start_date="2024-06-30",
+            end_date="2024-06-30",
+            total_transactions=1,
+            money_in=45.0,
+            money_out=0.0,
+            net_cashflow=45.0,
+            transactions=[
+                {
+                    "user_transaction_id": "11223",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-06-30",
+                    "description": "Dividend VTI",
+                    "amount": 45.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_cash_out": False,
+                    "is_income": True,
+                    "is_spending": False,
+                    "transaction_type": "Dividend Received",
+                    "symbol": "VTI",
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(div_tx, balances=self.balances)
+        self.assertIn('2024-06-30 * "Acme Brokerage" "Dividend VTI" ^empower-tx-11223', output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage    45.00 USD", output)
+        self.assertIn("Income:Dividends                       -45.00 USD", output)
+
+    def test_reconciliation_baseline_holdings_lots(self):
+        # 60 VTI snapshot - (20 buys - 10 sells) = 50 baseline shares
+        # 15 AAPL snapshot - (15 buys - 0 sells) = 0 baseline shares
+        holdings_output = self.generator.generate_holdings_bean(
+            holdings=self.holdings_snapshot,
+            balances=self.balances,
+            transactions=self.transactions_history,
+            opening_date="2020-01-01",
+        )
+
+        # Assert VTI opening lot of 50 shares exists
+        self.assertIn("50.000000 VTI", holdings_output)
+        self.assertIn('2020-01-01 * "Acme Brokerage Portfolio Snapshot" "VTI Position"', holdings_output)
+
+        # Assert AAPL has 0 opening lots in holdings.bean
+        self.assertNotIn("AAPL", holdings_output)
+
+    def test_reconciliation_transactions_and_balances_assertions(self):
+        tx_output = self.generator.generate_transactions_bean(self.transactions_history, balances=self.balances)
+        # AAPL only appears on its genuine trade date: 2022-03-10
+        self.assertIn('2022-03-10 * "Acme Brokerage" "Buy AAPL"', tx_output)
+
+        # Final balances assertions on 2024-10-01 assert full portfolio snapshot quantities:
+        # 60 VTI and 15 AAPL
+        bal_output = self.generator.generate_balances_bean(
+            balances=self.balances,
+            holdings=self.holdings_snapshot,
+            transactions=self.transactions_history,
+        )
+        self.assertIn("2024-10-01 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
+        self.assertIn("2024-10-01 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
+
+    def test_modular_ledger_export_lifecycle_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dest = Path(tmp_dir) / "ledger"
+            created = self.generator.export_modular_ledger(
+                destination_dir=dest,
+                balances=self.balances,
+                holdings=self.holdings_snapshot,
+                transactions=self.transactions_history,
+                opening_date="2020-01-01",
+            )
+            self.assertEqual(len(created), 6)
+
+            holdings_bean = (dest / "holdings.bean").read_text(encoding="utf-8")
+            # Baseline lot of 50 VTI, 0 AAPL
+            self.assertIn("50.000000 VTI", holdings_bean)
+            self.assertNotIn("AAPL", holdings_bean)
+
+            tx_bean = (dest / "transactions.bean").read_text(encoding="utf-8")
+            self.assertIn("15.000000 AAPL", tx_bean)
+
+            bal_bean = (dest / "balances.bean").read_text(encoding="utf-8")
+            self.assertIn("60.000000 VTI", bal_bean)
+            self.assertIn("15.000000 AAPL", bal_bean)
+
+            accounts_bean = (dest / "accounts.bean").read_text(encoding="utf-8")
+            self.assertIn("open Income:CapitalGains", accounts_bean)
+            self.assertIn("open Income:Dividends USD", accounts_bean)
+
+    def test_single_file_export_lifecycle_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = Path(tmp_dir) / "full_ledger.bean"
+            self.generator.export_single_file(
+                filepath=target,
+                balances=self.balances,
+                holdings=self.holdings_snapshot,
+                transactions=self.transactions_history,
+                opening_date="2020-01-01",
+            )
+            content = target.read_text(encoding="utf-8")
+            self.assertIn("50.000000 VTI", content)
+            self.assertIn("60.000000 VTI", content)
+            self.assertIn("15.000000 AAPL", content)
+            self.assertIn("open Income:CapitalGains", content)
+            self.assertIn("open Income:Dividends USD", content)
+
+    def test_double_entry_balance_mathematical_integrity(self):
+        # Verify that all Buy transactions have matching lot cost and cash outflow
+        buy_tx = DashboardTransactions(
+            start_date="2024-03-15",
+            end_date="2024-03-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=2205.0,
+            net_cashflow=-2205.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-check-buy",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-03-15",
+                    "description": "Buy VTI",
+                    "amount": 2205.0,
+                    "is_credit": False,
+                    "is_cash_in": False,
+                    "is_cash_out": True,
+                    "is_income": False,
+                    "is_spending": False,
+                    "transaction_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 220.50,
+                    "quantity": 10.0,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
+        # Parse commodity posting: 10.000000 * 220.5000 = 2205.00 USD
+        # Parse cash posting: -2205.00 USD
+        # Sum = 0.00
+        lot_match = re.search(r"([\d\.]+)\s+VTI\s+\{([\d\.]+)\s+USD\}", output)
+        cash_match = re.search(r"\n\s+Assets:\S+\s+(-?[\d\.]+)\s+USD\n", output)
+        self.assertIsNotNone(lot_match)
+        self.assertIsNotNone(cash_match)
+        qty, price = float(lot_match.group(1)), float(lot_match.group(2))
+        cash = float(cash_match.group(1))
+        self.assertAlmostEqual(qty * price + cash, 0.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
