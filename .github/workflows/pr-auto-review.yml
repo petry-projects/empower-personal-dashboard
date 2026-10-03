@@ -69,11 +69,6 @@ concurrency:
 
 jobs:
   pr-auto-review:
-    # Skip fork-origin pull_request events: forks get no org secrets, so the PAT
-    # resolves empty and the reusable cannot authenticate. The credentialed
-    # workflow_run / check_suite / pull_request_review paths are unaffected (they
-    # are not `pull_request`). Same guard pattern as copilot-setup-steps.yml.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     permissions:
       pull-requests: read
       checks: read
