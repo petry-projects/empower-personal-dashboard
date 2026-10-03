@@ -835,8 +835,8 @@ def _run_beancount_export(args, client, balances_res, holdings_res, transactions
     if not balances_res and not offline_mode:
         try:
             balances_res = client.fetch_balances()
-        except Exception as e:
-            logger.debug("Could not fetch balances to enrich Beancount accounts: %s", e)
+        except Exception:
+            logger.debug("Could not fetch balances to enrich Beancount accounts")
 
     mapper = BeancountMapper(mapping_path=args.beancount_map)
     generator = BeancountGenerator(mapper=mapper)
