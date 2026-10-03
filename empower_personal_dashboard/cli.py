@@ -869,11 +869,17 @@ def main() -> int:
             mapper = BeancountMapper(mapping_path=args.beancount_map)
             generator = BeancountGenerator(mapper=mapper)
             output_parts = []
+            # Declare FIFO booking so streamed sell postings (empty cost spec)
+            # resolve deterministically against reconstructed multi-lot holdings.
+            output_parts.append(
+                'option "operating_currency" "USD"\n'
+                'option "booking_method" "FIFO"\n'
+            )
             output_parts.append(generator.generate_accounts_bean(balances_res, holdings_res, transactions_res))
             if balances_res or holdings_res:
-                output_parts.append(generator.generate_balances_bean(balances_res, holdings_res))
+                output_parts.append(generator.generate_balances_bean(balances_res, holdings_res, transactions=transactions_res))
             if holdings_res:
-                output_parts.append(generator.generate_holdings_bean(holdings_res, balances=balances_res, opening_date=args.opening_date))
+                output_parts.append(generator.generate_holdings_bean(holdings_res, balances=balances_res, transactions=transactions_res, opening_date=args.opening_date))
                 output_parts.append(generator.generate_prices_bean(holdings_res))
             if transactions_res:
                 output_parts.append(generator.generate_transactions_bean(transactions_res, balances=balances_res))

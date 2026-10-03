@@ -380,6 +380,55 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertEqual(point["total_liabilities"], 5000.0)
         self.assertEqual(point["net_worth"], 145000.0)
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_sanitizes_mojibake_date_and_keys(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        "date": "2024-01-01�",
+                        "totalAssets": 100000.0,
+                        "balances": {"ACC�-1": 100000.0},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        # The U+FFFD replacement character is stripped from the date and keys.
+        self.assertEqual(point["date"], "2024-01-01")
+        self.assertNotIn("�", point["date"])
+        self.assertIn("ACC-1", point["balances"])
+        self.assertTrue(all("�" not in k for k in point["balances"]))
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_wraps_malformed_numeric_in_empower_error(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {"date": "2024-01-01", "totalAssets": "N/A"}
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        # A non-numeric totalAssets must surface as the domain EmpowerError
+        # rather than a raw ValueError leaking from normalization.
+        with self.assertRaises(EmpowerError):
+            self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+
 
 class TestClientMockMode(unittest.TestCase):
     def test_offline_sandbox_mock_generators(self):

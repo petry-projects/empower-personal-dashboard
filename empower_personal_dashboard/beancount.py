@@ -760,7 +760,17 @@ class BeancountGenerator:
 
         if holdings and holdings.holdings:
             as_of = holdings.as_of_date
-            lines.append(f"\n;; Investment Commodity Unit Balances (as of {as_of})\n")
+            # Beancount evaluates balance directives at the beginning of the day,
+            # so a trade dated on as_of has not yet posted when an assertion dated
+            # as_of is checked. Asserting the snapshot on the following day counts
+            # all same-day activity and keeps the reconstructed inventory exact.
+            try:
+                assert_date = (
+                    datetime.date.fromisoformat(as_of) + datetime.timedelta(days=1)
+                ).isoformat()
+            except Exception:
+                assert_date = as_of
+            lines.append(f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, asserted {assert_date})\n")
             # Aggregate positions by (b_account, ticker) to avoid duplicate conflicting balance assertions
             holding_units: Dict[Tuple[str, str], float] = {}
             for h in holdings.holdings:
@@ -786,7 +796,7 @@ class BeancountGenerator:
                     holding_units[(b_account, ticker)] = holding_units.get((b_account, ticker), 0.0) + qty
 
             for (b_account, ticker), total_qty in sorted(holding_units.items()):
-                lines.append(f"{as_of} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
+                lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
 
         return "".join(lines)
 
@@ -853,6 +863,9 @@ class BeancountGenerator:
 
         # Calculate net transaction buys per (b_account, ticker) across the transaction history
         net_buys: Dict[Tuple[str, str], float] = {}
+        # Per-key metadata (firm + a representative price) used to reconstruct
+        # synthetic opening lots for securities fully sold within the window.
+        net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
         if transactions and transactions.transactions:
             for tx in transactions.transactions:
                 sym = tx.get("symbol")
@@ -866,6 +879,9 @@ class BeancountGenerator:
                 tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
                 if tx_qty <= 0:
                     continue
+
+                tx_raw_price = tx.get("price")
+                tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
 
                 aid = str(tx.get("account_id") or "")
                 uaid = str(tx.get("user_account_id") or "")
@@ -887,10 +903,22 @@ class BeancountGenerator:
                 inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
 
                 key = (tx_b_account, t_ticker)
-                if tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest"):
+                is_tx_buy = tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest")
+                is_tx_sell = tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal")
+                if is_tx_buy:
                     net_buys[key] = net_buys.get(key, 0.0) + tx_qty
-                elif tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal"):
+                elif is_tx_sell:
                     net_buys[key] = net_buys.get(key, 0.0) - tx_qty
+
+                if is_tx_buy or is_tx_sell:
+                    meta = net_buy_meta.setdefault(
+                        key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
+                    )
+                    if tx_price > 0:
+                        if meta["any_price"] <= 0:
+                            meta["any_price"] = tx_price
+                        if is_tx_buy and meta["buy_price"] <= 0:
+                            meta["buy_price"] = tx_price
 
         # Aggregate positions by (b_account, ticker) to emit each snapshot position only once
         aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -976,6 +1004,44 @@ class BeancountGenerator:
                     f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} @ {_format_price(price)} USD\n"
                 )
             lines.append(f"  {'Equity:Opening-Balances':<36}\n\n")
+
+        # Reconstruct opening lots for securities that existed before the window
+        # and were fully sold within it. Such a position is absent from the
+        # current holdings snapshot, yet its net buys are negative; without a
+        # synthetic opening lot the reconstructed sales would reduce an empty
+        # inventory and the historical ledger would fail to load.
+        if transactions is not None and transactions.transactions:
+            for key in sorted(net_buys):
+                if key in aggregated_holdings:
+                    continue
+                nb = net_buys.get(key, 0.0)
+                if nb >= -0.000001:
+                    continue
+
+                b_account, ticker = key
+                holding_tag = f"{b_account}:{ticker}"
+                if holding_tag in existing_keys:
+                    continue
+
+                baseline_qty = -nb
+                meta = net_buy_meta.get(key, {})
+                firm = meta.get("firm") or "Brokerage"
+                opening_price = meta.get("buy_price") or meta.get("any_price") or 0.0
+
+                payee_esc = _escape_beancount_string(f"{firm} Portfolio Snapshot")
+                narration_esc = _escape_beancount_string(f"{ticker} Opening Position")
+                lines.append(f'{lot_date} * "{payee_esc}" "{narration_esc}"\n')
+                lines.append(f'  empower_holding: "{holding_tag}"\n')
+                if opening_price > 0:
+                    lines.append(
+                        f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker} "
+                        f"{{{_format_cost(opening_price)} USD}}\n"
+                    )
+                else:
+                    lines.append(
+                        f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker}\n"
+                    )
+                lines.append(f"  {'Equity:Opening-Balances':<36}\n\n")
 
         return "".join(lines)
 

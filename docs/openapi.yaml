@@ -1122,10 +1122,18 @@ components:
           example: 547050.00
         balances:
           type: object
+          description: >-
+            Map of account ID to balance on that date. Upstream responses may
+            also carry sibling keys suffixed `Annotation` whose values are
+            textual notes rather than numbers; these are modelled separately via
+            patternProperties and ignored by the client normalizer.
+          patternProperties:
+            "Annotation$":
+              type: string
+              description: Optional textual annotation for an account balance entry.
           additionalProperties:
             type: number
             format: double
-          description: Map of account ID to balance on that date.
           example:
             "1001": 350000.00
             "1002": 120000.00

@@ -678,49 +678,60 @@ class EmpowerDashboardClient:
         except Exception as e:
             raise EmpowerError(f"Failed to fetch account histories from dashboard: {e}") from e
 
-        sp_data = result.get("spData", {})
-        resp_start = sp_data.get("startDate") or start_date or ""
-        resp_end = sp_data.get("endDate") or end_date or ""
-        raw_hist = sp_data.get("histories", [])
+        # Response normalization is part of this public API's guarded path: a
+        # malformed numeric field (e.g. "N/A" in totalAssets) must surface as a
+        # domain EmpowerError rather than a raw ValueError, while a genuine
+        # SessionExpiredError keeps propagating untouched.
+        try:
+            sp_data = result.get("spData", {})
+            resp_start = clean_api_text(sp_data.get("startDate") or start_date or "")
+            resp_end = clean_api_text(sp_data.get("endDate") or end_date or "")
+            raw_hist = sp_data.get("histories", [])
 
-        normalized_histories = []
-        for entry in raw_hist:
-            date_str = str(entry.get("date") or "")
-            if not date_str:
-                continue
+            normalized_histories = []
+            for entry in raw_hist:
+                # Textual history fields may carry upstream mojibake; sanitize the
+                # date and account-balance keys before they enter the payload.
+                date_str = clean_api_text(entry.get("date"))
+                if not date_str:
+                    continue
 
-            total_assets = entry.get("totalAssets")
-            if total_assets is None:
-                total_assets = entry.get("aggregateBalance")
+                total_assets = entry.get("totalAssets")
+                if total_assets is None:
+                    total_assets = entry.get("aggregateBalance")
 
-            raw_balances = entry.get("balances", {})
-            clean_balances: Dict[str, float] = {}
-            if isinstance(raw_balances, dict):
-                for k, v in raw_balances.items():
-                    if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
-                        clean_balances[str(k)] = float(v)
+                raw_balances = entry.get("balances", {})
+                clean_balances: Dict[str, float] = {}
+                if isinstance(raw_balances, dict):
+                    for k, v in raw_balances.items():
+                        if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
+                            clean_balances[clean_api_text(k)] = float(v)
 
-            if total_assets is None and clean_balances:
-                # Sum only positive balances: negative entries are liability
-                # accounts, and including them would yield net worth rather than
-                # total assets (and double-count liabilities in net_worth below).
-                total_assets = sum(v for v in clean_balances.values() if v > 0)
+                if total_assets is None and clean_balances:
+                    # Sum only positive balances: negative entries are liability
+                    # accounts, and including them would yield net worth rather than
+                    # total assets (and double-count liabilities in net_worth below).
+                    total_assets = sum(v for v in clean_balances.values() if v > 0)
 
-            total_assets_val = float(total_assets or 0.0)
-            total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
-            net_worth_val = (
-                float(entry.get("netWorth"))
-                if entry.get("netWorth") is not None
-                else (total_assets_val - total_liab_val)
-            )
+                total_assets_val = float(total_assets or 0.0)
+                total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
+                net_worth_val = (
+                    float(entry.get("netWorth"))
+                    if entry.get("netWorth") is not None
+                    else (total_assets_val - total_liab_val)
+                )
 
-            normalized_histories.append({
-                "date": date_str,
-                "net_worth": net_worth_val,
-                "total_assets": total_assets_val,
-                "total_liabilities": total_liab_val,
-                "balances": clean_balances,
-            })
+                normalized_histories.append({
+                    "date": date_str,
+                    "net_worth": net_worth_val,
+                    "total_assets": total_assets_val,
+                    "total_liabilities": total_liab_val,
+                    "balances": clean_balances,
+                })
+        except SessionExpiredError:
+            raise
+        except Exception as e:
+            raise EmpowerError(f"Failed to normalize account histories from dashboard: {e}") from e
 
         return DashboardHistories(
             start_date=resp_start,

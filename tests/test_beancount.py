@@ -347,9 +347,10 @@ class TestBeancountGenerator(unittest.TestCase):
         self.assertIn("2026-10-01 balance Assets:AllyBank:EverydayChecking 5000.00 USD", output)
         # Credit liability balance is asserted as negative in Beancount
         self.assertIn("2026-10-01 balance Liabilities:Chase:SapphireReserve -2000.00 USD", output)
-        # Commodity balance assertions with high-precision format
-        self.assertIn("2026-10-01 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
-        self.assertIn("2026-10-01 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
+        # Commodity balance assertions are dated the day after the snapshot so
+        # Beancount's beginning-of-day evaluation counts any same-day trades.
+        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
+        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
 
     def test_generate_prices_bean(self):
         output = self.generator.generate_prices_bean(self.synthetic_holdings)
@@ -1195,20 +1196,64 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         # Assert AAPL has 0 opening lots in holdings.bean
         self.assertNotIn("AAPL", holdings_output)
 
+    def test_reconciliation_opening_lot_for_fully_sold_security(self):
+        # A pre-window GE position is completely sold within the window: it is
+        # absent from the holdings snapshot but has negative net buys, so a
+        # synthetic opening lot must be reconstructed or the sale would reduce an
+        # empty inventory and the historical ledger would fail to load.
+        fully_sold = DashboardTransactions(
+            start_date="2023-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=2500.0,
+            money_out=0.0,
+            net_cashflow=2500.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-ge-sell",
+                    "account_id": "ACC-BRK-001",
+                    "user_account_id": 5001,
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2023-05-01",
+                    "description": "Sell GE",
+                    "amount": 2500.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_cash_out": False,
+                    "transaction_type": "Sell",
+                    "investment_type": "Sell",
+                    "symbol": "GE",
+                    "price": 100.0,
+                    "quantity": 25.0,
+                }
+            ],
+        )
+        holdings_output = self.generator.generate_holdings_bean(
+            holdings=self.holdings_snapshot,  # only VTI + AAPL, no GE
+            balances=self.balances,
+            transactions=fully_sold,
+            opening_date="2020-01-01",
+        )
+        # 25-share GE opening lot reconstructed at the trade price so the later
+        # sale has real inventory to reduce.
+        self.assertIn("25.000000 GE {100.000000 USD}", holdings_output)
+        self.assertIn('"GE Opening Position"', holdings_output)
+
     def test_reconciliation_transactions_and_balances_assertions(self):
         tx_output = self.generator.generate_transactions_bean(self.transactions_history, balances=self.balances)
         # AAPL only appears on its genuine trade date: 2022-03-10
         self.assertIn('2022-03-10 * "Acme Brokerage" "Buy AAPL"', tx_output)
 
-        # Final balances assertions on 2024-10-01 assert full portfolio snapshot quantities:
-        # 60 VTI and 15 AAPL
+        # Final commodity balance assertions are dated the day after the snapshot
+        # (2024-10-02) and assert full portfolio snapshot quantities: 60 VTI and 15 AAPL
         bal_output = self.generator.generate_balances_bean(
             balances=self.balances,
             holdings=self.holdings_snapshot,
             transactions=self.transactions_history,
         )
-        self.assertIn("2024-10-01 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
-        self.assertIn("2024-10-01 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
 
     def test_modular_ledger_export_lifecycle_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
