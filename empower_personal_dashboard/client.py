@@ -1105,7 +1105,7 @@ class EmpowerDashboardClient:
         # Honour an account filter so a scoped history request does not leak
         # every account's balance; recompute aggregates from the kept balances.
         requested_user_ids = self._normalize_account_filter(user_account_ids)
-        if requested_user_ids:
+        if requested_user_ids is not None:
             account_id_map = {
                 "1001": "ACC-INV-001",
                 "1002": "ACC-IRA-002",
@@ -1130,13 +1130,18 @@ class EmpowerDashboardClient:
         )
 
     @staticmethod
-    def _normalize_account_filter(user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]]) -> Set[str]:
-        """Normalize a userAccountIds filter (list, tuple, or CSV string) to a set of ids."""
+    def _normalize_account_filter(user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]]) -> Optional[Set[str]]:
+        """Normalize a userAccountIds filter (list, tuple, or CSV string) to a set of ids.
+
+        Returns None if filter is omitted, empty set if filter is explicitly empty.
+        """
         if user_account_ids is None:
-            return set()
+            return None
         if isinstance(user_account_ids, str):
-            return {part.strip() for part in user_account_ids.split(",") if part.strip()}
+            normalized = {part.strip() for part in user_account_ids.split(",") if part.strip()}
+            return normalized if normalized else set()
         if isinstance(user_account_ids, (list, tuple, set)):
-            return {str(x).strip() for x in user_account_ids if str(x).strip()}
+            normalized = {str(x).strip() for x in user_account_ids if str(x).strip()}
+            return normalized if normalized else set()
         return {str(user_account_ids).strip()}
 

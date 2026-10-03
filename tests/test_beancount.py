@@ -1076,8 +1076,9 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         self.assertNotIn("TaxableBrokerage  -100.00 USD", output)
 
     def test_buy_cash_leg_balances_when_amount_bundles_a_fee(self):
-        # The reported amount (520) includes a $20 commission; the cash leg is
-        # derived from qty x price (500) so the transaction stays balanced.
+        # The reported amount (520) includes a $20 commission; the cash leg
+        # preserves the full reported amount (520), and a separate Expenses:Fees
+        # posting records the $20 difference between amount and qty × price (500).
         buy_tx = DashboardTransactions(
             start_date="2024-03-15",
             end_date="2024-03-15",
@@ -1104,8 +1105,9 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         )
         output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
         self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   2.000000 VTI {250.0000 USD}", output)
-        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  -500.00 USD", output)
-        self.assertNotIn("-520.00 USD", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  -520.00 USD", output)
+        self.assertIn("Expenses:Fees", output)
+        self.assertIn("20.00 USD", output)
 
     def test_banking_dividend_category_alone_is_not_investment_dividend(self):
         # A plain banking transaction categorized "dividend" (no ticker, no

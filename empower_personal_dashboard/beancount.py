@@ -601,6 +601,7 @@ class BeancountGenerator:
             "2000-01-01 open Equity:Opening-Balances USD\n"
             "2000-01-01 open Equity:Transfers USD\n"
             "2000-01-01 open Expenses:Uncategorized USD\n"
+            "2000-01-01 open Expenses:Fees USD\n"
             "2000-01-01 open Income:Uncategorized USD\n"
             "2000-01-01 open Income:CapitalGains\n"
             "2000-01-01 open Income:Dividends USD\n\n"
@@ -611,6 +612,7 @@ class BeancountGenerator:
             "Equity:Opening-Balances",
             "Equity:Transfers",
             "Expenses:Uncategorized",
+            "Expenses:Fees",
             "Income:Uncategorized",
             "Income:CapitalGains",
             "Income:Dividends",
@@ -1135,21 +1137,14 @@ class BeancountGenerator:
             t_name = tx.get("account_name") or ""
 
             # Resolve true account identity and type against balances lookup if available.
-            # Security trades fall back to the brokerage identity (matching holdings
-            # reconciliation and assertions) so their postings reconcile in one account.
-            inv_fallback = _is_investment_tx(tx)
-            fb_firm = "Brokerage" if inv_fallback else "Institution"
-            fb_name = "Brokerage" if inv_fallback else "Account"
-            fb_type = "investment" if inv_fallback else "bank"
+            # Use _resolve_account_from_tx to ensure investment transactions consistently
+            # fall back to the brokerage identity (matching holdings reconciliation and
+            # assertions) so their postings reconcile in one account.
+            firm, acct_name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
             acct_info = acct_lookup.get(acct_id) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
             if acct_info:
-                firm = acct_info.get("firm_name") or fb_firm
-                acct_name = acct_info.get("account_name") or t_name or fb_name
-                acct_type = acct_info.get("account_type") or fb_type
-                resolved_id = str(acct_info.get("account_id") or acct_id)
                 is_asset = acct_info.get("is_asset", True)
             else:
-                firm, acct_name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
                 type_lower = acct_type.lower()
                 is_asset = not (
                     "credit" in type_lower
@@ -1216,14 +1211,14 @@ class BeancountGenerator:
                 inv_narration = _escape_beancount_string(tx.get("description") or "")
 
                 if is_buy:
+                    reported_amount = amount
                     if price == 0 and amount > 0 and qty > 0:
                         price = amount / qty
-                    # Derive the cash outflow from qty × price so the commodity
-                    # lot (priced per unit) always balances exactly against the
-                    # cash posting, even when the reported amount bundles a
-                    # fee/commission that would otherwise leave it unbalanced.
-                    if price > 0 and qty > 0:
-                        amount = round(qty * price, 2)
+                    # Calculate lot cost from qty × price; preserve full reported amount
+                    # as the cash outflow. If reported amount exceeds lot cost, the
+                    # difference is recorded as an Expenses:Fees posting.
+                    calculated_cost = round(qty * price, 2) if price > 0 and qty > 0 else 0.0
+                    fee = round(reported_amount - calculated_cost, 2) if calculated_cost > 0 else 0.0
                     # Reinvested dividends are funded by dividend income, not by
                     # brokerage cash; routing them through the cash-outflow leg
                     # would wrongly drain USD and omit the dividend income.
@@ -1242,7 +1237,11 @@ class BeancountGenerator:
                         f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
                         f"{{{_format_price(price)} USD}}\n"
                     )
-                    lines.append(f"  {funding_account:<36} {-amount:>8.2f} USD\n\n")
+                    lines.append(f"  {funding_account:<36} {-reported_amount:>8.2f} USD\n")
+                    if fee > 0:
+                        fees_acct = self.mapper.categories.get("Fees") or "Expenses:Fees"
+                        lines.append(f"  {fees_acct:<36} {fee:>8.2f} USD\n")
+                    lines.append("\n")
                     continue
 
                 if is_sell:

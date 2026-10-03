@@ -758,7 +758,7 @@ def main() -> int:
                 end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 # Beancount reconstruction requires complete transaction history, not truncated.
                 # Apply limit only for display purposes (via render functions), not the fetch.
-                tx_limit = None if args.beancount else args.limit
+                tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
                 transactions_res = client.fetch_transactions(
                     start_date=start_date,
                     end_date=end_date,
