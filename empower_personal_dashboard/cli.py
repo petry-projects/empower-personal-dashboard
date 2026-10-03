@@ -756,11 +756,14 @@ def main() -> int:
             else:
                 start_date = args.start_date
                 end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                # Beancount reconstruction requires complete transaction history, not truncated.
+                # Apply limit only for display purposes (via render functions), not the fetch.
+                tx_limit = None if args.beancount else args.limit
                 transactions_res = client.fetch_transactions(
                     start_date=start_date,
                     end_date=end_date,
                     user_account_ids=args.account_id,
-                    limit=args.limit,
+                    limit=tx_limit,
                 )
                 t_data = transactions_res.to_dict()
                 t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()

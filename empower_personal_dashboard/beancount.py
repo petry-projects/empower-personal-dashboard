@@ -838,21 +838,25 @@ class BeancountGenerator:
             ";; ==============================================================================\n\n"
         ]
 
-        if not holdings or not holdings.holdings:
-            return "".join(lines)
+        # Must reconstruct opening lots for fully-sold positions even if holdings snapshot is empty,
+        # or sells will reduce an empty inventory and the ledger will fail to load.
+        # Early return moved to end of function, after reconstruction setup.
 
-        as_of = holdings.as_of_date
+        as_of = holdings.as_of_date if holdings else None
         effective_opening = opening_date or _determine_opening_date(transactions, balances, None)
         if effective_opening:
             lot_date = effective_opening
         else:
             # Date holdings snapshot transaction before the balance assertion date so Beancount's
             # beginning-of-day balance assertion on as_of passes cleanly.
-            try:
-                d = datetime.date.fromisoformat(as_of)
-                lot_date = (d - datetime.timedelta(days=1)).isoformat()
-            except Exception:
-                lot_date = as_of
+            if as_of:
+                try:
+                    d = datetime.date.fromisoformat(as_of)
+                    lot_date = (d - datetime.timedelta(days=1)).isoformat()
+                except Exception:
+                    lot_date = as_of
+            else:
+                lot_date = "2020-01-01"
 
         acct_lookup = _build_account_lookup(balances)
 
@@ -923,46 +927,47 @@ class BeancountGenerator:
         # Aggregate positions by (b_account, ticker) to emit each snapshot position only once
         aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-        for h in holdings.holdings:
-            ticker = _clean_ticker(h.get("ticker"))
-            qty = float(h.get("quantity") or 0.0)
-            price = float(h.get("price") or 0.0)
-            cost_basis = h.get("cost_basis")
-            uaid = str(h.get("user_account_id") or "")
-            h_name = h.get("account_name") or ""
+        if holdings and holdings.holdings:
+            for h in holdings.holdings:
+                ticker = _clean_ticker(h.get("ticker"))
+                qty = float(h.get("quantity") or 0.0)
+                price = float(h.get("price") or 0.0)
+                cost_basis = h.get("cost_basis")
+                uaid = str(h.get("user_account_id") or "")
+                h_name = h.get("account_name") or ""
 
-            acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-            if acct_info:
-                firm = acct_info.get("firm_name") or "Brokerage"
-                acct_name = acct_info.get("account_name") or h_name or "Brokerage"
-                acct_type = acct_info.get("account_type") or "investment"
-                acct_id = str(acct_info.get("account_id") or uaid)
-            else:
-                firm = h.get("firm_name") or "Brokerage"
-                acct_name = h_name or "Brokerage"
-                acct_type = "investment"
-                acct_id = uaid
-
-            if ticker and qty > 0:
-                b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
-                key = (b_account, ticker)
-                if key not in aggregated_holdings:
-                    aggregated_holdings[key] = {
-                        "firm": firm,
-                        "b_account": b_account,
-                        "ticker": ticker,
-                        "quantity": qty,
-                        "price": price,
-                        "cost_basis": float(cost_basis) if cost_basis is not None else None,
-                    }
+                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
+                if acct_info:
+                    firm = acct_info.get("firm_name") or "Brokerage"
+                    acct_name = acct_info.get("account_name") or h_name or "Brokerage"
+                    acct_type = acct_info.get("account_type") or "investment"
+                    acct_id = str(acct_info.get("account_id") or uaid)
                 else:
-                    agg = aggregated_holdings[key]
-                    agg["quantity"] += qty
-                    if cost_basis is not None:
-                        curr_cb = agg["cost_basis"] or 0.0
-                        agg["cost_basis"] = curr_cb + float(cost_basis)
-                    if price > 0:
-                        agg["price"] = price
+                    firm = h.get("firm_name") or "Brokerage"
+                    acct_name = h_name or "Brokerage"
+                    acct_type = "investment"
+                    acct_id = uaid
+
+                if ticker and qty > 0:
+                    b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
+                    key = (b_account, ticker)
+                    if key not in aggregated_holdings:
+                        aggregated_holdings[key] = {
+                            "firm": firm,
+                            "b_account": b_account,
+                            "ticker": ticker,
+                            "quantity": qty,
+                            "price": price,
+                            "cost_basis": float(cost_basis) if cost_basis is not None else None,
+                        }
+                    else:
+                        agg = aggregated_holdings[key]
+                        agg["quantity"] += qty
+                        if cost_basis is not None:
+                            curr_cb = agg["cost_basis"] or 0.0
+                            agg["cost_basis"] = curr_cb + float(cost_basis)
+                        if price > 0:
+                            agg["price"] = price
 
         for pos in sorted(aggregated_holdings.values(), key=lambda p: (p["b_account"], p["ticker"])):
             b_account = pos["b_account"]
