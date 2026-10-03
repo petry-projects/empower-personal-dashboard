@@ -763,7 +763,7 @@ class BeancountGenerator:
             for h in holdings.holdings:
                 firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
                 commodity_accounts.add(
-                    self.mapper.resolve_account(firm, acct_name, acct_id, acct_type)
+                    self.mapper.resolve_account(firm, acct_name, acct_id, acct_type, is_asset=True)
                 )
         return commodity_accounts
 
@@ -803,7 +803,7 @@ class BeancountGenerator:
             return
         for h in holdings.holdings:
             firm, name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
-            b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
+            b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type, is_asset=True)
             if b_account in seen_accounts:
                 continue
             seen_accounts.add(b_account)
@@ -995,7 +995,7 @@ class BeancountGenerator:
             if not (ticker and qty > 0):
                 continue
             firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
-            b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
+            b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type, is_asset=True)
             holding_units[(b_account, ticker)] = holding_units.get((b_account, ticker), 0.0) + qty
 
         for (b_account, ticker), total_qty in sorted(holding_units.items()):
