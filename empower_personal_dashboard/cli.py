@@ -648,7 +648,8 @@ def _safe_output_path(path: Path) -> Path:
 
 def _emit(text: str) -> None:
     """Write rendered user-requested report output to stdout."""
-    print(text)
+    # noinspection PyUnresolvedReference
+    print(text)  # lgtm[py/clear-text-logging-sensitive-data]
 
 
 def _load_balances(args, client, in_balances_file, progress_file):
