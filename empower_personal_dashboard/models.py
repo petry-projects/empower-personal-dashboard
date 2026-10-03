@@ -233,3 +233,53 @@ class DashboardTransactions:
             mode=data.get("mode", "historical"),
             raw_response=data.get("raw_response"),
         )
+
+
+@dataclass
+class DailyHistoryPoint:
+    date: str
+    net_worth: float
+    total_assets: float = 0.0
+    total_liabilities: float = 0.0
+    balances: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "date": self.date,
+            "net_worth": round(self.net_worth, 2),
+            "total_assets": round(self.total_assets, 2),
+            "total_liabilities": round(self.total_liabilities, 2),
+            "balances": self.balances,
+        }
+
+
+@dataclass
+class DashboardHistories:
+    start_date: str
+    end_date: str
+    histories: List[Dict[str, Any]]
+    total_points: int = 0
+    mode: str = "live"
+    raw_response: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "total_points": self.total_points or len(self.histories),
+            "histories": self.histories,
+            "mode": self.mode,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DashboardHistories":
+        raw_hist = list(data.get("histories", []))
+        return cls(
+            start_date=data.get("start_date", ""),
+            end_date=data.get("end_date", ""),
+            histories=raw_hist,
+            total_points=int(data.get("total_points", len(raw_hist))),
+            mode=data.get("mode", "live"),
+            raw_response=data.get("raw_response"),
+        )
+

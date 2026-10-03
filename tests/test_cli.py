@@ -340,6 +340,42 @@ class TestCLI(unittest.TestCase):
         _, kwargs = mock_txs.call_args
         self.assertEqual(kwargs.get("start_date"), "2024-01-01")
 
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_cli_beancount_format_with_transactions_ignores_limit(self, mock_txs):
+        from empower_personal_dashboard.models import DashboardTransactions
+
+        mock_txs.return_value = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2026-10-02",
+            total_transactions=0,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[],
+        )
+
+        argv = [
+            "empower",
+            "--transactions",
+            "--format",
+            "beancount",
+            "--limit",
+            "50",
+            "--quiet",
+            "--session-file",
+            "/nonexistent/session.json",
+            "--mock",
+        ]
+        with patch.object(sys, "argv", argv):
+            exit_code = cli_main()
+            self.assertEqual(exit_code, 0)
+
+        mock_txs.assert_called_once()
+        _, kwargs = mock_txs.call_args
+        # When --format beancount is used with --transactions, limit should be None
+        # to fetch complete history for accurate Beancount reconstruction
+        self.assertIsNone(kwargs.get("limit"))
+
 
 if __name__ == "__main__":
     unittest.main()

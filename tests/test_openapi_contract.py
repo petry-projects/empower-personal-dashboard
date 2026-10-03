@@ -28,7 +28,9 @@ from empower_personal_dashboard import __version__ as PACKAGE_VERSION
 from empower_personal_dashboard.client import EmpowerDashboardClient
 from empower_personal_dashboard.models import (
     AccountBalance,
+    DailyHistoryPoint,
     DashboardBalances,
+    DashboardHistories,
     DashboardHoldings,
     DashboardTransactions,
     InvestmentHolding,
@@ -141,6 +143,7 @@ class TestOpenApiContract(unittest.TestCase):
             "/invest/getHoldings",
             "/transaction/getUserTransactions",
             "/transaction/getUserTransactions2",
+            "/account/getHistories",
         ]
 
         paths = self.spec.get("paths", {})
@@ -286,6 +289,36 @@ class TestOpenApiContract(unittest.TestCase):
         }
         self._validate_schema(raw_response, "GetUserTransactionsEnvelope")
 
+    def test_contract_upstream_get_histories_envelope(self):
+        """Validate raw getHistories RPC response matches GetHistoriesEnvelope schema."""
+        raw_response = {
+            "spHeader": {
+                "success": True,
+                "authLevel": "USER_REMEMBERED",
+                "csrf": "csrf-synth-12345",
+                "status": "OK",
+                "code": 0,
+            },
+            "spData": {
+                "histories": [
+                    {
+                        "date": "2026-09-01",
+                        "totalAssets": 549500.0,
+                        "totalLiabilities": 2450.0,
+                        "netWorth": 547050.0,
+                        "balances": {
+                            "1001": 350000.0,
+                            "1002": 120000.0,
+                            "1003": 75000.0,
+                            "1004": 4500.0,
+                            "1005": 2450.0,
+                        },
+                    }
+                ],
+            },
+        }
+        self._validate_schema(raw_response, "GetHistoriesEnvelope")
+
     def test_contract_upstream_identify_user_envelope(self):
         """Validate identifyUser 2FA challenge response matches IdentifyUserEnvelope schema."""
         raw_response = {
@@ -394,6 +427,26 @@ class TestOpenApiContract(unittest.TestCase):
             category_id=1,
         )
         self._validate_schema(tx.to_dict(), "Transaction")
+
+    def test_contract_domain_dashboard_histories(self):
+        """Validate DashboardHistories dataclass serialization against DashboardHistories schema."""
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories()
+        self._validate_schema(histories.to_dict(), "DashboardHistories")
+
+    def test_contract_domain_daily_history_point(self):
+        """Validate DailyHistoryPoint dataclass serialization against DailyHistoryPoint schema."""
+        point = DailyHistoryPoint(
+            date="2026-09-01",
+            total_assets=549500.0,
+            total_liabilities=2450.0,
+            net_worth=547050.0,
+            balances={
+                "1001": 350000.0,
+                "1002": 120000.0,
+            },
+        )
+        self._validate_schema(point.to_dict(), "DailyHistoryPoint")
 
     def test_contract_domain_net_worth_summary(self):
         """Validate NetWorthSummary serialization against NetWorthSummary schema."""

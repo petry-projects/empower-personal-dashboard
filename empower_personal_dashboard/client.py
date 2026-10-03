@@ -14,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import requests
 
@@ -26,6 +26,7 @@ from .exceptions import (
 )
 from .models import (
     DashboardBalances,
+    DashboardHistories,
     DashboardHoldings,
     DashboardTransactions,
 )
@@ -62,6 +63,59 @@ def _env_flag(value: Optional[str]) -> bool:
     if value is None:
         return False
     return value.strip().lower() not in _FALSY_ENV_VALUES
+
+
+def _clean_history_balances(raw_balances: Any) -> Dict[str, float]:
+    """Sanitize a raw per-account balances map, dropping textual annotation siblings."""
+    clean_balances: Dict[str, float] = {}
+    if isinstance(raw_balances, dict):
+        for k, v in raw_balances.items():
+            if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
+                clean_balances[clean_api_text(k)] = float(v)
+    return clean_balances
+
+
+def _normalize_history_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a single raw history entry into the dashboard payload shape.
+
+    Returns the normalized dict, or None if the entry should be skipped
+    (i.e. its sanitized date is empty).
+    """
+    # Textual history fields may carry upstream mojibake; sanitize the
+    # date and account-balance keys before they enter the payload.
+    date_str = clean_api_text(entry.get("date"))
+    if not date_str:
+        return None
+
+    total_assets = entry.get("totalAssets")
+    if total_assets is None:
+        total_assets = entry.get("aggregateBalance")
+
+    clean_balances = _clean_history_balances(entry.get("balances", {}))
+
+    if total_assets is None and clean_balances:
+        # Sum only positive balances: negative entries are liability
+        # accounts, and including them would yield net worth rather than
+        # total assets (and double-count liabilities in net_worth below).
+        total_assets = sum(v for v in clean_balances.values() if v > 0)
+
+    total_assets_val = float(total_assets or 0.0)
+    total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
+    if entry.get("totalLiabilities") is None and clean_balances:
+        total_liab_val = sum(-v for v in clean_balances.values() if v < 0)
+    net_worth_val = (
+        float(entry.get("netWorth"))
+        if entry.get("netWorth") is not None
+        else (total_assets_val - total_liab_val)
+    )
+
+    return {
+        "date": date_str,
+        "net_worth": net_worth_val,
+        "total_assets": total_assets_val,
+        "total_liabilities": total_liab_val,
+        "balances": clean_balances,
+    }
 
 
 class EmpowerDashboardClient:
@@ -571,14 +625,14 @@ class EmpowerDashboardClient:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        user_account_ids: Optional[Any] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
         limit: Optional[int] = None,
     ) -> DashboardTransactions:
         """Fetch account transactions for a date range, optionally filtered by account."""
         if self.mock_mode:
             return self._generate_mock_transactions(start_date=start_date, end_date=end_date, limit=limit)
 
-        payload: Dict[str, Any] = {}
+        payload: Dict[str, Union[str, int, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = {}
         if start_date:
             payload["startDate"] = start_date
         if end_date:
@@ -644,6 +698,65 @@ class EmpowerDashboardClient:
             money_out=money_out,
             net_cashflow=net_cashflow,
             transactions=normalized_txs,
+            mode="live",
+            raw_response=result,
+        )
+
+    def fetch_histories(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
+    ) -> DashboardHistories:
+        """Fetch historical daily balance and net worth curve directly from Empower."""
+        if self.mock_mode:
+            return self._generate_mock_histories(
+                start_date=start_date,
+                end_date=end_date,
+                user_account_ids=user_account_ids,
+            )
+
+        payload: Dict[str, Union[str, int, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = {}
+        if start_date:
+            payload["startDate"] = start_date
+        if end_date:
+            payload["endDate"] = end_date
+        if user_account_ids is not None:
+            payload["userAccountIds"] = user_account_ids
+
+        try:
+            result = self.fetch("/account/getHistories", data=payload)
+        except SessionExpiredError:
+            raise
+        except Exception as e:
+            raise EmpowerError(f"Failed to fetch account histories from dashboard: {e}") from e
+
+        # Response normalization is part of this public API's guarded path: a
+        # malformed numeric field (e.g. "N/A" in totalAssets) must surface as a
+        # domain EmpowerError rather than a raw ValueError, while a genuine
+        # SessionExpiredError keeps propagating untouched.
+        try:
+            sp_data = result.get("spData", {})
+            resp_start = clean_api_text(sp_data.get("startDate") or start_date or "")
+            resp_end = clean_api_text(sp_data.get("endDate") or end_date or "")
+            raw_hist = sp_data.get("histories", [])
+
+            normalized_histories = []
+            for entry in raw_hist:
+                normalized_entry = _normalize_history_entry(entry)
+                if normalized_entry is None:
+                    continue
+                normalized_histories.append(normalized_entry)
+        except SessionExpiredError:
+            raise
+        except Exception as e:
+            raise EmpowerError(f"Failed to normalize account histories from dashboard: {e}") from e
+
+        return DashboardHistories(
+            start_date=resp_start,
+            end_date=resp_end,
+            total_points=len(normalized_histories),
+            histories=normalized_histories,
             mode="live",
             raw_response=result,
         )
@@ -927,3 +1040,125 @@ class EmpowerDashboardClient:
             transactions=mock_txs,
             mode="sandbox_mock",
         )
+
+    def _generate_mock_histories(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
+    ) -> DashboardHistories:
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        start = start_date or "2024-01-01"
+        end = end_date or today_str
+
+        # Emit points at the start, the midpoint, and the end of the requested
+        # range so offline callers observe the same [start, end] range semantics
+        # as live retrieval (rather than fixed calendar dates in the start year).
+        def _midpoint(s: str, e: str) -> str:
+            try:
+                ds = datetime.strptime(s, "%Y-%m-%d").date()
+                de = datetime.strptime(e, "%Y-%m-%d").date()
+                if de < ds:
+                    de = ds
+                return (ds + (de - ds) / 2).strftime("%Y-%m-%d")
+            except ValueError:
+                return s
+
+        mid = _midpoint(start, end)
+
+        mock_histories = [
+            {
+                "date": start,
+                "net_worth": 485000.0,
+                "total_assets": 487500.0,
+                "total_liabilities": 2500.0,
+                "balances": {
+                    "ACC-INV-001": 310000.0,
+                    "ACC-IRA-002": 115000.0,
+                    "ACC-CHK-003": 20000.0,
+                    "ACC-SAV-004": 42500.0,
+                    "ACC-CRD-005": -2500.0,
+                },
+            },
+            {
+                "date": mid,
+                "net_worth": 512000.0,
+                "total_assets": 514200.0,
+                "total_liabilities": 2200.0,
+                "balances": {
+                    "ACC-INV-001": 330000.0,
+                    "ACC-IRA-002": 120000.0,
+                    "ACC-CHK-003": 22000.0,
+                    "ACC-SAV-004": 42200.0,
+                    "ACC-CRD-005": -2200.0,
+                },
+            },
+            {
+                "date": end,
+                "net_worth": 552050.0,
+                "total_assets": 554500.0,
+                "total_liabilities": 2450.0,
+                "balances": {
+                    "ACC-INV-001": 350000.0,
+                    "ACC-IRA-002": 125000.0,
+                    "ACC-CHK-003": 24500.0,
+                    "ACC-SAV-004": 55000.0,
+                    "ACC-CRD-005": -2450.0,
+                },
+            },
+        ]
+
+        # Collapse points that resolve to the same calendar date so a short
+        # requested range yields distinct, internally consistent daily
+        # snapshots instead of several contradictory values on one date: a
+        # one-day request makes start == mid == end, and a two-day request can
+        # make start == mid. The last candidate for a date wins, keeping the
+        # freshest snapshot for that day.
+        collapsed: Dict[str, Dict[str, Union[str, float, Dict[str, float]]]] = {}
+        for point in mock_histories:
+            collapsed[point["date"]] = point
+        mock_histories = list(collapsed.values())
+
+        # Honour an account filter so a scoped history request does not leak
+        # every account's balance; recompute aggregates from the kept balances.
+        requested_user_ids = self._normalize_account_filter(user_account_ids)
+        if requested_user_ids is not None:
+            account_id_map = {
+                "1001": "ACC-INV-001",
+                "1002": "ACC-IRA-002",
+                "1003": "ACC-CHK-003",
+                "1004": "ACC-SAV-004",
+                "1005": "ACC-CRD-005",
+            }
+            requested_account_ids = {account_id_map.get(uid, uid) for uid in requested_user_ids}
+            for point in mock_histories:
+                kept = {k: v for k, v in point["balances"].items() if k in requested_account_ids}
+                point["balances"] = kept
+                point["total_assets"] = sum(v for v in kept.values() if v > 0)
+                point["total_liabilities"] = sum(-v for v in kept.values() if v < 0)
+                point["net_worth"] = point["total_assets"] - point["total_liabilities"]
+
+        return DashboardHistories(
+            start_date=start,
+            end_date=end,
+            total_points=len(mock_histories),
+            histories=mock_histories,
+            mode="sandbox_mock",
+        )
+
+    @staticmethod
+    def _normalize_account_filter(user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]]) -> Optional[Set[str]]:
+        """Normalize a userAccountIds filter (list, tuple, or CSV string) to a set of ids.
+
+        Returns None if filter is omitted, empty set if filter is explicitly empty.
+        """
+        if user_account_ids is None:
+            return None
+        if isinstance(user_account_ids, str):
+            normalized = {part.strip() for part in user_account_ids.split(",") if part.strip()}
+            return normalized if normalized else set()
+        if isinstance(user_account_ids, (list, tuple, set)):
+            normalized = {str(x).strip() for x in user_account_ids if str(x).strip()}
+            return normalized if normalized else set()
+        return {str(user_account_ids).strip()}
+
