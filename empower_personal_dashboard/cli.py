@@ -367,10 +367,10 @@ def render_balances_markdown(balances: DashboardBalances) -> str:
 
     for acct in balances.accounts:
         firm = acct.get("firm_name", "—")
-        name = acct.get("account_name", "Account")
+        acct_name = acct.get("account_name", "Account")
         acct_type = acct.get("account_type", "OTHER")
         bal = acct.get("balance", 0.0)
-        lines.append(f"| {firm} | {name} | `{acct_type}` | {format_currency(bal)} |")
+        lines.append(f"| {firm} | {acct_name} | `{acct_type}` | {format_currency(bal)} |")
 
     return "\n".join(lines)
 
