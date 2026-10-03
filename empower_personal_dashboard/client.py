@@ -579,7 +579,7 @@ class EmpowerDashboardClient:
         if self.mock_mode:
             return self._generate_mock_transactions(start_date=start_date, end_date=end_date, limit=limit)
 
-        payload: Dict[str, Any] = {}
+        payload: Dict[str, Union[str, int, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = {}
         if start_date:
             payload["startDate"] = start_date
         if end_date:
@@ -663,7 +663,7 @@ class EmpowerDashboardClient:
                 user_account_ids=user_account_ids,
             )
 
-        payload: Dict[str, Any] = {}
+        payload: Dict[str, Union[str, int, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = {}
         if start_date:
             payload["startDate"] = start_date
         if end_date:
@@ -1097,7 +1097,7 @@ class EmpowerDashboardClient:
         # one-day request makes start == mid == end, and a two-day request can
         # make start == mid. The last candidate for a date wins, keeping the
         # freshest snapshot for that day.
-        collapsed: Dict[str, Dict[str, Any]] = {}
+        collapsed: Dict[str, Dict[str, Union[str, float, Dict[str, float]]]] = {}
         for point in mock_histories:
             collapsed[point["date"]] = point
         mock_histories = list(collapsed.values())
