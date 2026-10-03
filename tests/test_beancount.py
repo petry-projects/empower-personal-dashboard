@@ -1041,6 +1041,143 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage    45.00 USD", output)
         self.assertIn("Income:Dividends                       -45.00 USD", output)
 
+    def test_reinvested_dividend_funds_shares_from_dividend_income(self):
+        # A reinvestment buys shares funded by dividend income, so it must not
+        # drain brokerage cash; the funding leg posts to Income:Dividends.
+        reinvest_tx = DashboardTransactions(
+            start_date="2024-07-01",
+            end_date="2024-07-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-44556",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-07-01",
+                    "description": "Reinvest VTI",
+                    "amount": 100.0,
+                    "transaction_type": "Reinvest",
+                    "investment_type": "Reinvest",
+                    "symbol": "VTI",
+                    "price": 250.0,
+                    "quantity": 0.4,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(reinvest_tx, balances=self.balances)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   0.400000 VTI {250.0000 USD}", output)
+        self.assertIn("Income:Dividends                      -100.00 USD", output)
+        # Brokerage cash is not drained for a reinvestment.
+        self.assertNotIn("TaxableBrokerage  -100.00 USD", output)
+
+    def test_buy_cash_leg_balances_when_amount_bundles_a_fee(self):
+        # The reported amount (520) includes a $20 commission; the cash leg is
+        # derived from qty x price (500) so the transaction stays balanced.
+        buy_tx = DashboardTransactions(
+            start_date="2024-03-15",
+            end_date="2024-03-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=520.0,
+            net_cashflow=-520.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-77",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-03-15",
+                    "description": "Buy VTI",
+                    "amount": 520.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 250.0,
+                    "quantity": 2.0,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   2.000000 VTI {250.0000 USD}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  -500.00 USD", output)
+        self.assertNotIn("-520.00 USD", output)
+
+    def test_banking_dividend_category_alone_is_not_investment_dividend(self):
+        # A plain banking transaction categorized "dividend" (no ticker, no
+        # investment type) must go through category resolution, not Income:Dividends.
+        bank_tx = DashboardTransactions(
+            start_date="2024-07-02",
+            end_date="2024-07-02",
+            total_transactions=1,
+            money_in=12.0,
+            money_out=0.0,
+            net_cashflow=12.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-99",
+                    "account_id": "acc-chk",
+                    "account_name": "Checking",
+                    "firm_name": "Ally Bank",
+                    "transaction_date": "2024-07-02",
+                    "description": "Interest payout",
+                    "amount": 12.0,
+                    "is_income": True,
+                    "category_name": "Dividend",
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(bank_tx, balances=self.balances)
+        self.assertNotIn("Income:Dividends", output)
+
+    def test_transaction_only_investment_account_opened_without_currency(self):
+        # Investment accounts seen only via transactions must be opened without a
+        # USD currency constraint so ticker commodity postings are accepted.
+        tx_only = DashboardTransactions(
+            start_date="2021-06-15",
+            end_date="2021-06-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=4000.0,
+            net_cashflow=-4000.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-1",
+                    "account_id": "ACC-BRK-009",
+                    "account_name": "Growth Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2021-06-15",
+                    "description": "Buy VTI",
+                    "amount": 4000.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 200.0,
+                    "quantity": 20.0,
+                }
+            ],
+        )
+        accounts_bean = self.generator.generate_accounts_bean(transactions=tx_only)
+        self.assertIn("2000-01-01 open Assets:AcmeBrokerage:GrowthBrokerage\n", accounts_bean)
+        self.assertNotIn("open Assets:AcmeBrokerage:GrowthBrokerage USD", accounts_bean)
+
+    def test_generated_ledger_headers_set_fifo_booking_method(self):
+        main_bean = self.generator.generate_main_bean()
+        self.assertIn('option "booking_method" "FIFO"', main_bean)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            single = Path(tmp_dir) / "ledger.bean"
+            self.generator.export_single_file(
+                single,
+                balances=self.balances,
+                transactions=self.transactions_history,
+                append=False,
+            )
+            self.assertIn('option "booking_method" "FIFO"', single.read_text(encoding="utf-8"))
+
     def test_reconciliation_baseline_holdings_lots(self):
         # 60 VTI snapshot - (20 buys - 10 sells) = 50 baseline shares
         # 15 AAPL snapshot - (15 buys - 0 sells) = 0 baseline shares

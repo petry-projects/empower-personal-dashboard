@@ -327,6 +327,59 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertEqual(kwargs["data"]["startDate"], "2024-01-01")
         self.assertEqual(kwargs["data"]["endDate"], "2024-01-31")
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_total_assets_fallback_excludes_liabilities(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        # totalAssets and netWorth omitted -> both are derived.
+                        "date": "2024-01-01",
+                        "balances": {"ACC-1": 100000.0, "ACC-CARD": -5000.0},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        # Only positive balances count as assets; the negative card is a liability.
+        self.assertEqual(point["total_assets"], 100000.0)
+        # net_worth must not subtract the liability twice.
+        self.assertEqual(point["net_worth"], 100000.0)
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_normalizes_liabilities_to_absolute(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        "date": "2024-01-01",
+                        "totalAssets": 150000.0,
+                        "totalLiabilities": -5000.0,
+                        "balances": {},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        self.assertEqual(point["total_liabilities"], 5000.0)
+        self.assertEqual(point["net_worth"], 145000.0)
+
 
 class TestClientMockMode(unittest.TestCase):
     def test_offline_sandbox_mock_generators(self):
@@ -350,6 +403,31 @@ class TestClientMockMode(unittest.TestCase):
         self.assertEqual(histories.mode, "sandbox_mock")
         self.assertGreater(histories.total_points, 0)
         self.assertGreater(histories.histories[0]["net_worth"], 0)
+
+    def test_mock_histories_points_stay_within_requested_range(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-03-01", end_date="2024-09-30")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates[0], "2024-03-01")
+        self.assertEqual(dates[-1], "2024-09-30")
+        for d in dates:
+            self.assertGreaterEqual(d, "2024-03-01")
+            self.assertLessEqual(d, "2024-09-30")
+        # Dates are non-decreasing (chronological).
+        self.assertEqual(dates, sorted(dates))
+
+    def test_mock_histories_respect_account_filter(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            user_account_ids=["ACC-CHK-003"],
+        )
+        for point in histories.histories:
+            self.assertEqual(list(point["balances"].keys()), ["ACC-CHK-003"])
+            # Aggregates are recomputed from the single kept (positive) balance.
+            self.assertEqual(point["total_liabilities"], 0.0)
+            self.assertEqual(point["total_assets"], point["balances"]["ACC-CHK-003"])
 
     def test_mock_transactions_start_date_reflects_oldest_mock(self):
         client = EmpowerDashboardClient(mock_mode=True)

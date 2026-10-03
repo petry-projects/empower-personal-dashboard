@@ -319,6 +319,7 @@ paths:
       description: Retrieves daily snapshots of total assets, total liabilities, net worth, and individual account balances across a specified date range.
       operationId: getHistories
       requestBody:
+        required: true
         content:
           application/x-www-form-urlencoded:
             schema:

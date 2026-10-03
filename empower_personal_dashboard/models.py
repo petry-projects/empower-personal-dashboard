@@ -279,7 +279,7 @@ class DashboardHistories:
             end_date=data.get("end_date", ""),
             histories=raw_hist,
             total_points=int(data.get("total_points", len(raw_hist))),
-            mode=data.get("mode", "historical"),
+            mode=data.get("mode", "live"),
             raw_response=data.get("raw_response"),
         )
 

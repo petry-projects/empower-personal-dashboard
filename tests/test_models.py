@@ -133,6 +133,17 @@ class TestModels(unittest.TestCase):
         self.assertEqual(restored.start_date, "2024-01-01")
         self.assertEqual(restored.total_points, 1)
 
+    def test_histories_from_dict_defaults_mode_to_schema_valid_live(self):
+        from empower_personal_dashboard.models import DashboardHistories
+
+        # When the payload omits mode, the default must be a schema-supported
+        # value ("live"/"sandbox_mock"), never the invalid "historical".
+        restored = DashboardHistories.from_dict(
+            {"start_date": "2024-01-01", "end_date": "2024-01-31", "histories": []}
+        )
+        self.assertEqual(restored.mode, "live")
+        self.assertEqual(restored.to_dict()["mode"], "live")
+
 
 if __name__ == "__main__":
     unittest.main()

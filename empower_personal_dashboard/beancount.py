@@ -487,7 +487,8 @@ class BeancountGenerator:
             ";; Empower Personal Dashboard - Root Beancount Ledger\n"
             ";; ==============================================================================\n\n"
             'option "title" "Empower Personal Dashboard Ledger"\n'
-            'option "operating_currency" "USD"\n\n'
+            'option "operating_currency" "USD"\n'
+            'option "booking_method" "FIFO"\n\n'
             'plugin "beancount.plugins.auto_accounts"\n\n'
             ';; Fava Web Dashboard Display Configuration\n'
             '1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"\n\n'
@@ -599,6 +600,37 @@ class BeancountGenerator:
 
         # 3. Accounts from transactions
         if transactions and transactions.transactions:
+            # Pre-pass: identify transaction accounts that receive commodity
+            # (ticker) postings, so their `open` is left currency-unconstrained.
+            commodity_tx_accounts: Set[str] = set()
+            for tx in transactions.transactions:
+                if not _clean_ticker(tx.get("symbol")):
+                    continue
+                tt = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+                it = clean_api_text(tx.get("investment_type") or "").strip().lower()
+                if not (
+                    tt in ("buy", "sell", "reinvest", "disposal")
+                    or it in ("buy", "sell", "reinvest", "disposal")
+                ):
+                    continue
+                aid = str(tx.get("account_id") or "")
+                uaid = str(tx.get("user_account_id") or "")
+                t_name = tx.get("account_name") or ""
+                acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
+                if acct_info:
+                    firm = acct_info.get("firm_name") or "Institution"
+                    name = acct_info.get("account_name") or t_name or "Account"
+                    acct_type = acct_info.get("account_type") or "bank"
+                    resolved_id = str(acct_info.get("account_id") or aid)
+                else:
+                    firm = tx.get("firm_name") or "Institution"
+                    name = t_name or "Account"
+                    acct_type = tx.get("account_type") or "bank"
+                    resolved_id = aid
+                commodity_tx_accounts.add(
+                    self.mapper.resolve_account(firm, name, resolved_id, acct_type)
+                )
+
             for tx in transactions.transactions:
                 aid = str(tx.get("account_id") or "")
                 uaid = str(tx.get("user_account_id") or "")
@@ -618,7 +650,15 @@ class BeancountGenerator:
                 b_account = self.mapper.resolve_account(firm, name, resolved_id, acct_type)
                 if b_account not in seen_accounts:
                     seen_accounts.add(b_account)
-                    lines.append(f"2000-01-01 open {b_account} USD\n")
+                    # Investment accounts may hold ticker commodities, so leave
+                    # them currency-unconstrained; cash-only accounts stay USD.
+                    if b_account in commodity_accounts or b_account in commodity_tx_accounts or any(
+                        inv_word in str(acct_type).lower()
+                        for inv_word in ("invest", "broker", "ira", "401k", "roth", "rollover", "stock", "portfolio", "529", "other")
+                    ):
+                        lines.append(f"2000-01-01 open {b_account}\n")
+                    else:
+                        lines.append(f"2000-01-01 open {b_account} USD\n")
 
         # 4. Open any custom mapped accounts, categories, and regex rule accounts
         for custom_acct in self.mapper.accounts.values():
@@ -1025,7 +1065,11 @@ class BeancountGenerator:
             is_dividend = (
                 "dividend" in tx_type_clean
                 or "dividend" in inv_type_clean
-                or "dividend" in cat_clean
+                # A bare "dividend" category needs investment evidence (a ticker
+                # plus a transaction/investment type) before it is treated as an
+                # investment dividend; otherwise ordinary banking transactions
+                # labelled "dividend" would skip category resolution.
+                or ("dividend" in cat_clean and bool(ticker) and bool(tx_type_clean or inv_type_clean))
             )
 
             # Resolve payee and narration for investment transactions
@@ -1039,8 +1083,21 @@ class BeancountGenerator:
                 if is_buy:
                     if price == 0 and amount > 0 and qty > 0:
                         price = amount / qty
-                    if amount == 0 and price > 0 and qty > 0:
+                    # Derive the cash outflow from qty × price so the commodity
+                    # lot (priced per unit) always balances exactly against the
+                    # cash posting, even when the reported amount bundles a
+                    # fee/commission that would otherwise leave it unbalanced.
+                    if price > 0 and qty > 0:
                         amount = round(qty * price, 2)
+                    # Reinvested dividends are funded by dividend income, not by
+                    # brokerage cash; routing them through the cash-outflow leg
+                    # would wrongly drain USD and omit the dividend income.
+                    is_reinvest = tx_type_clean == "reinvest" or inv_type_clean == "reinvest"
+                    funding_account = (
+                        (self.mapper.categories.get("Dividends") or "Income:Dividends")
+                        if is_reinvest
+                        else primary_account
+                    )
                     lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
                     if tx_id:
                         lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
@@ -1050,7 +1107,7 @@ class BeancountGenerator:
                         f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
                         f"{{{_format_price(price)} USD}}\n"
                     )
-                    lines.append(f"  {primary_account:<36} {-amount:>8.2f} USD\n\n")
+                    lines.append(f"  {funding_account:<36} {-amount:>8.2f} USD\n\n")
                     continue
 
                 if is_sell:
@@ -1329,7 +1386,8 @@ class BeancountGenerator:
             ";; Empower Personal Dashboard - Single Ledger Export\n"
             ";; ==============================================================================\n\n"
             'option "title" "Empower Personal Dashboard Ledger"\n'
-            'option "operating_currency" "USD"\n\n',
+            'option "operating_currency" "USD"\n'
+            'option "booking_method" "FIFO"\n\n',
             'plugin "beancount.plugins.auto_accounts"\n\n',
             ';; Fava Web Dashboard Display Configuration\n',
             '1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"\n\n',

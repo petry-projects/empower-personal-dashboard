@@ -14,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import requests
 
@@ -657,7 +657,11 @@ class EmpowerDashboardClient:
     ) -> DashboardHistories:
         """Fetch historical daily balance and net worth curve directly from Empower."""
         if self.mock_mode:
-            return self._generate_mock_histories(start_date=start_date, end_date=end_date)
+            return self._generate_mock_histories(
+                start_date=start_date,
+                end_date=end_date,
+                user_account_ids=user_account_ids,
+            )
 
         payload: Dict[str, Any] = {}
         if start_date:
@@ -697,14 +701,17 @@ class EmpowerDashboardClient:
                         clean_balances[str(k)] = float(v)
 
             if total_assets is None and clean_balances:
-                total_assets = sum(clean_balances.values())
+                # Sum only positive balances: negative entries are liability
+                # accounts, and including them would yield net worth rather than
+                # total assets (and double-count liabilities in net_worth below).
+                total_assets = sum(v for v in clean_balances.values() if v > 0)
 
             total_assets_val = float(total_assets or 0.0)
-            total_liab_val = float(entry.get("totalLiabilities") or 0.0)
+            total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
             net_worth_val = (
                 float(entry.get("netWorth"))
                 if entry.get("netWorth") is not None
-                else (total_assets_val - abs(total_liab_val))
+                else (total_assets_val - total_liab_val)
             )
 
             normalized_histories.append({
@@ -1008,14 +1015,30 @@ class EmpowerDashboardClient:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        user_account_ids: Optional[Any] = None,
     ) -> DashboardHistories:
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         start = start_date or "2024-01-01"
         end = end_date or today_str
 
+        # Emit points at the start, the midpoint, and the end of the requested
+        # range so offline callers observe the same [start, end] range semantics
+        # as live retrieval (rather than fixed calendar dates in the start year).
+        def _midpoint(s: str, e: str) -> str:
+            try:
+                ds = datetime.strptime(s, "%Y-%m-%d").date()
+                de = datetime.strptime(e, "%Y-%m-%d").date()
+                if de < ds:
+                    de = ds
+                return (ds + (de - ds) / 2).strftime("%Y-%m-%d")
+            except ValueError:
+                return s
+
+        mid = _midpoint(start, end)
+
         mock_histories = [
             {
-                "date": f"{start[:4]}-01-01",
+                "date": start,
                 "net_worth": 485000.0,
                 "total_assets": 487500.0,
                 "total_liabilities": 2500.0,
@@ -1028,7 +1051,7 @@ class EmpowerDashboardClient:
                 },
             },
             {
-                "date": f"{start[:4]}-06-01",
+                "date": mid,
                 "net_worth": 512000.0,
                 "total_assets": 514200.0,
                 "total_liabilities": 2200.0,
@@ -1055,6 +1078,17 @@ class EmpowerDashboardClient:
             },
         ]
 
+        # Honour an account filter so a scoped history request does not leak
+        # every account's balance; recompute aggregates from the kept balances.
+        requested = self._normalize_account_filter(user_account_ids)
+        if requested:
+            for point in mock_histories:
+                kept = {k: v for k, v in point["balances"].items() if k in requested}
+                point["balances"] = kept
+                point["total_assets"] = sum(v for v in kept.values() if v > 0)
+                point["total_liabilities"] = sum(-v for v in kept.values() if v < 0)
+                point["net_worth"] = point["total_assets"] - point["total_liabilities"]
+
         return DashboardHistories(
             start_date=start,
             end_date=end,
@@ -1062,4 +1096,15 @@ class EmpowerDashboardClient:
             histories=mock_histories,
             mode="sandbox_mock",
         )
+
+    @staticmethod
+    def _normalize_account_filter(user_account_ids: Optional[Any]) -> Set[str]:
+        """Normalize a userAccountIds filter (list, tuple, or CSV string) to a set of ids."""
+        if user_account_ids is None:
+            return set()
+        if isinstance(user_account_ids, str):
+            return {part.strip() for part in user_account_ids.split(",") if part.strip()}
+        if isinstance(user_account_ids, (list, tuple, set)):
+            return {str(x).strip() for x in user_account_ids if str(x).strip()}
+        return {str(user_account_ids).strip()}
 
