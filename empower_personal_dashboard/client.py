@@ -715,6 +715,8 @@ class EmpowerDashboardClient:
 
                 total_assets_val = float(total_assets or 0.0)
                 total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
+                if entry.get("totalLiabilities") is None and clean_balances:
+                    total_liab_val = sum(-v for v in clean_balances.values() if v < 0)
                 net_worth_val = (
                     float(entry.get("netWorth"))
                     if entry.get("netWorth") is not None
@@ -1091,10 +1093,18 @@ class EmpowerDashboardClient:
 
         # Honour an account filter so a scoped history request does not leak
         # every account's balance; recompute aggregates from the kept balances.
-        requested = self._normalize_account_filter(user_account_ids)
-        if requested:
+        requested_user_ids = self._normalize_account_filter(user_account_ids)
+        if requested_user_ids:
+            account_id_map = {
+                "1001": "ACC-INV-001",
+                "1002": "ACC-IRA-002",
+                "1003": "ACC-CHK-003",
+                "1004": "ACC-SAV-004",
+                "1005": "ACC-CRD-005",
+            }
+            requested_account_ids = {account_id_map.get(uid, uid) for uid in requested_user_ids}
             for point in mock_histories:
-                kept = {k: v for k, v in point["balances"].items() if k in requested}
+                kept = {k: v for k, v in point["balances"].items() if k in requested_account_ids}
                 point["balances"] = kept
                 point["total_assets"] = sum(v for v in kept.values() if v > 0)
                 point["total_liabilities"] = sum(-v for v in kept.values() if v < 0)

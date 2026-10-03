@@ -351,8 +351,9 @@ class TestClientDataParsing(unittest.TestCase):
         point = histories.histories[0]
         # Only positive balances count as assets; the negative card is a liability.
         self.assertEqual(point["total_assets"], 100000.0)
-        # net_worth must not subtract the liability twice.
-        self.assertEqual(point["net_worth"], 100000.0)
+        self.assertEqual(point["total_liabilities"], 5000.0)
+        # net_worth = total_assets - total_liabilities
+        self.assertEqual(point["net_worth"], 95000.0)
 
     @patch("requests.Session.post")
     def test_fetch_histories_normalizes_liabilities_to_absolute(self, mock_post):
