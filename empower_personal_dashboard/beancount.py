@@ -239,6 +239,35 @@ def _build_account_lookup(balances: Optional[DashboardBalances]) -> Dict[str, Di
     return lookup
 
 
+def _resolve_account_from_tx(
+    transaction: Dict[str, Any],
+    acct_lookup: Dict[str, Dict[str, Any]],
+    default_firm: str = "Institution",
+    default_type: str = "bank",
+) -> Tuple[str, str, str, str]:
+    """Resolve account details from transaction and lookup table.
+
+    Returns: (firm, account_name, account_type, resolved_id)
+    """
+    aid = str(transaction.get("account_id") or "")
+    uaid = str(transaction.get("user_account_id") or "")
+    t_name = transaction.get("account_name") or ""
+
+    acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
+    if acct_info:
+        firm = acct_info.get("firm_name") or default_firm
+        acct_name = acct_info.get("account_name") or t_name or "Account"
+        acct_type = acct_info.get("account_type") or default_type
+        resolved_id = str(acct_info.get("account_id") or aid)
+    else:
+        firm = transaction.get("firm_name") or default_firm
+        acct_name = t_name or "Account"
+        acct_type = transaction.get("account_type") or default_type
+        resolved_id = aid
+
+    return firm, acct_name, acct_type, resolved_id
+
+
 class BeancountMapper:
     """Handles mapping of Empower accounts, categories, and payee rules to Beancount accounts."""
 
@@ -613,39 +642,13 @@ class BeancountGenerator:
                     or it in ("buy", "sell", "reinvest", "disposal")
                 ):
                     continue
-                aid = str(tx.get("account_id") or "")
-                uaid = str(tx.get("user_account_id") or "")
-                t_name = tx.get("account_name") or ""
-                acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
-                if acct_info:
-                    firm = acct_info.get("firm_name") or "Institution"
-                    name = acct_info.get("account_name") or t_name or "Account"
-                    acct_type = acct_info.get("account_type") or "bank"
-                    resolved_id = str(acct_info.get("account_id") or aid)
-                else:
-                    firm = tx.get("firm_name") or "Institution"
-                    name = t_name or "Account"
-                    acct_type = tx.get("account_type") or "bank"
-                    resolved_id = aid
+                firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
                 commodity_tx_accounts.add(
                     self.mapper.resolve_account(firm, name, resolved_id, acct_type)
                 )
 
             for tx in transactions.transactions:
-                aid = str(tx.get("account_id") or "")
-                uaid = str(tx.get("user_account_id") or "")
-                t_name = tx.get("account_name") or ""
-                acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
-                if acct_info:
-                    firm = acct_info.get("firm_name") or "Institution"
-                    name = acct_info.get("account_name") or t_name or "Account"
-                    acct_type = acct_info.get("account_type") or "bank"
-                    resolved_id = str(acct_info.get("account_id") or aid)
-                else:
-                    firm = tx.get("firm_name") or "Institution"
-                    name = t_name or "Account"
-                    acct_type = tx.get("account_type") or "bank"
-                    resolved_id = aid
+                firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
 
                 b_account = self.mapper.resolve_account(firm, name, resolved_id, acct_type)
                 if b_account not in seen_accounts:
@@ -1082,10 +1085,7 @@ class BeancountGenerator:
                 resolved_id = str(acct_info.get("account_id") or acct_id)
                 is_asset = acct_info.get("is_asset", True)
             else:
-                firm = tx.get("firm_name") or "Institution"
-                acct_name = t_name or "Account"
-                acct_type = tx.get("account_type") or "bank"
-                resolved_id = acct_id
+                firm, acct_name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
                 type_lower = acct_type.lower()
                 is_asset = not (
                     "credit" in type_lower
