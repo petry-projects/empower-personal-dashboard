@@ -403,8 +403,8 @@ class TestBeancountGenerator(unittest.TestCase):
 
     def test_generate_holdings_lots_with_cost_basis(self):
         output = self.generator.generate_holdings_bean(self.synthetic_holdings)
-        # VTI has cost basis 8800.0 / 40.0 = 220.000000 USD
-        self.assertIn("40.000000 VTI {220.000000 USD} @ 280.0000 USD", output)
+        # VTI has cost basis 8800.0 using total-cost syntax
+        self.assertIn("40.000000 VTI {{8800.000000 USD}}", output)
         # BND has no cost basis -> formatted with @ price
         self.assertIn("10.000000 BND @ 80.0000 USD", output)
 
@@ -421,7 +421,7 @@ class TestBeancountGenerator(unittest.TestCase):
             content = single_file.read_text(encoding="utf-8")
             self.assertIn("open Assets:AllyBank:EverydayChecking USD", content)
             self.assertIn("2026-10-01 balance Assets:AllyBank:EverydayChecking 5000.00 USD", content)
-            self.assertIn("40.000000 VTI {220.000000 USD} @ 280.0000 USD", content)
+            self.assertIn("40.000000 VTI {{8800.000000 USD}}", content)
             self.assertIn("2026-10-01 price VTI 280.0000 USD", content)
             self.assertIn('2026-09-15 * "WHOLE FOODS MARKET"', content)
 
@@ -568,8 +568,8 @@ class TestBeancountGenerator(unittest.TestCase):
         )
         output = self.generator.generate_holdings_bean(holdings_data)
         self.assertIn("0.004200 BTC", output)
-        # Cost basis 210.0 / 0.0042 = 50000.000000
-        self.assertIn("{50000.000000 USD}", output)
+        # Cost basis 210.0 using total-cost syntax
+        self.assertIn("{{210.000000 USD}}", output)
 
     def test_transfer_routing_to_equity_transfers(self):
         tx_data = DashboardTransactions(
@@ -751,7 +751,7 @@ class TestBeancountGenerator(unittest.TestCase):
         )
         output = self.generator.generate_holdings_bean(holdings_data, balances=self.synthetic_balances)
         self.assertEqual(output.count("AAPL Position"), 1)
-        self.assertIn("15.000000 AAPL {150.000000 USD} @ 200.0000 USD", output)
+        self.assertIn("15.000000 AAPL {{2250.000000 USD}}", output)
         self.assertIn('empower_holding: "Assets:AllyBank:EverydayChecking:AAPL"', output)
 
     def test_holdings_lots_skip_existing_on_append(self):

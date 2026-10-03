@@ -1145,6 +1145,16 @@ components:
       type: object
       description: Data payload returned by getHistories RPC.
       properties:
+        startDate:
+          type: string
+          format: date
+          description: Start date of the historical query range returned (YYYY-MM-DD).
+          example: "2026-09-01"
+        endDate:
+          type: string
+          format: date
+          description: End date of the historical query range returned (YYYY-MM-DD).
+          example: "2026-09-30"
         histories:
           type: array
           items:
