@@ -425,6 +425,24 @@ class TestBeancountGenerator(unittest.TestCase):
             self.assertIn("2026-10-01 price VTI 280.0000 USD", content)
             self.assertIn('2026-09-15 * "WHOLE FOODS MARKET"', content)
 
+    def test_export_single_file_refuses_symlinked_target(self):
+        # A symlinked .bean target could redirect the write outside the intended
+        # path; export_single_file must refuse it before resolving/following it.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real = Path(tmp_dir) / "real.bean"
+            real.write_text(";; original\n", encoding="utf-8")
+            link = Path(tmp_dir) / "ledger.bean"
+            link.symlink_to(real)
+            with self.assertRaises(ValueError):
+                self.generator.export_single_file(
+                    filepath=link,
+                    balances=self.synthetic_balances,
+                    holdings=self.synthetic_holdings,
+                    transactions=self.synthetic_transactions,
+                )
+            # The real target behind the link is left untouched.
+            self.assertEqual(real.read_text(encoding="utf-8"), ";; original\n")
+
     def test_generate_main_bean_contains_fava_option(self):
         output = self.generator.generate_main_bean()
         self.assertIn('1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"', output)
@@ -1004,7 +1022,7 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         )
         output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
         self.assertIn('2024-03-15 * "Acme Brokerage" "Buy VTI" ^empower-tx-12345', output)
-        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  10.000000 VTI {220.5000 USD}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  10.000000 VTI {{2205.000000 USD}}", output)
         self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage -2205.00 USD", output)
         self.assertNotIn("Expenses:Uncategorized", output)
 
@@ -1103,7 +1121,7 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             ],
         )
         output = self.generator.generate_transactions_bean(reinvest_tx, balances=self.balances)
-        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   0.400000 VTI {250.0000 USD}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   0.400000 VTI {{100.000000 USD}}", output)
         self.assertIn("Income:Dividends                      -100.00 USD", output)
         # Brokerage cash is not drained for a reinvestment.
         self.assertNotIn("TaxableBrokerage  -100.00 USD", output)
@@ -1137,10 +1155,46 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             ],
         )
         output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
-        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   2.000000 VTI {250.0000 USD}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   2.000000 VTI {{500.000000 USD}}", output)
         self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  -520.00 USD", output)
         self.assertIn("Expenses:Fees", output)
         self.assertIn("20.00 USD", output)
+
+    def test_buy_derived_price_large_fractional_quantity_balances(self):
+        # Price is absent, so it is derived as amount / qty. A large fractional
+        # quantity makes a per-unit cost spec drift (qty × rounded-price would
+        # not equal the reported amount); the total-cost lot keeps the entry
+        # balanced against the full cash outflow with no spurious fee.
+        buy_tx = DashboardTransactions(
+            start_date="2024-03-15",
+            end_date="2024-03-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=1000.0,
+            net_cashflow=-1000.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-frac",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-03-15",
+                    "description": "Buy VTI",
+                    "amount": 1000.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 0.0,
+                    "quantity": 3.333333,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
+        # Lot is booked at the exact reported total so it balances the cash leg.
+        self.assertIn("3.333333 VTI {{1000.000000 USD}}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage -1000.00 USD", output)
+        # No fee leg: the full reported amount is the lot cost.
+        self.assertNotIn("Expenses:Fees", output)
 
     def test_banking_dividend_category_alone_is_not_investment_dividend(self):
         # A plain banking transaction categorized "dividend" (no ticker, no
@@ -1366,16 +1420,16 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             ],
         )
         output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
-        # Parse commodity posting: 10.000000 * 220.5000 = 2205.00 USD
-        # Parse cash posting: -2205.00 USD
-        # Sum = 0.00
-        lot_match = re.search(r"([\d\.]+)\s+VTI\s+\{([\d\.]+)\s+USD\}", output)
+        # The lot is booked with total-cost syntax {{TOTAL USD}} so the lot cost
+        # balances the cash leg exactly: total 2205.00 USD and cash -2205.00 USD
+        # sum to 0.00.
+        lot_match = re.search(r"([\d\.]+)\s+VTI\s+\{\{([\d\.]+)\s+USD\}\}", output)
         cash_match = re.search(r"\n\s+Assets:\S+\s+(-?[\d\.]+)\s+USD\n", output)
         self.assertIsNotNone(lot_match)
         self.assertIsNotNone(cash_match)
-        qty, price = float(lot_match.group(1)), float(lot_match.group(2))
+        total_cost = float(lot_match.group(2))
         cash = float(cash_match.group(1))
-        self.assertAlmostEqual(qty * price + cash, 0.0, places=2)
+        self.assertAlmostEqual(total_cost + cash, 0.0, places=2)
 
     def test_investment_tx_uses_brokerage_fallback_without_balances(self):
         # With no balances lookup, a security buy must resolve to the SAME

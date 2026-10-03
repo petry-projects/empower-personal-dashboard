@@ -377,12 +377,6 @@ class TestCLI(unittest.TestCase):
         self.assertIsNone(kwargs.get("limit"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
-
 class TestSafeOutputPath(unittest.TestCase):
     def test_resolves_regular_path_and_rejects_symlink(self):
         from empower_personal_dashboard.cli import _safe_output_path
@@ -394,3 +388,7 @@ class TestSafeOutputPath(unittest.TestCase):
             link.symlink_to(real)
             with self.assertRaises(ValueError):
                 _safe_output_path(link)
+
+
+if __name__ == "__main__":
+    unittest.main()

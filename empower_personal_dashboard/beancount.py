@@ -638,11 +638,16 @@ def _prepare_ledger_path(filepath: Union[str, Path], *, is_dir: bool) -> Path:
     raw = str(filepath)
     if "\x00" in raw:
         raise ValueError("Ledger path must not contain NUL bytes.")
-    resolved = Path(filepath).expanduser().resolve()
-    if resolved.is_symlink():
+    expanded = Path(filepath).expanduser()
+    # Inspect the user-supplied location for a symlink *before* resolving it.
+    # ``Path.resolve()`` follows symlinks, so a check on the resolved path can
+    # never see one — the link has already been dereferenced to its target.
+    # A symlinked target could redirect the write outside the intended path,
+    # so refuse it up front, then return the resolved absolute path.
+    if expanded.is_symlink():
         kind = "directory" if is_dir else "target file"
-        raise ValueError(f"Refusing to write to symlinked {kind}: {resolved}")
-    return resolved
+        raise ValueError(f"Refusing to write to symlinked {kind}: {expanded}")
+    return expanded.resolve()
 
 
 def _verify_not_symlink(p: Path) -> None:
@@ -1509,11 +1514,22 @@ class BeancountGenerator:
         reported_amount = amount
         if price == 0 and amount > 0 and qty > 0:
             price = amount / qty
-        # Calculate lot cost from qty × price; preserve full reported amount as the
-        # cash outflow. If reported amount exceeds lot cost, the difference is
-        # recorded as an Expenses:Fees posting.
+        # Book the lot at an explicit *total* cost so it balances exactly against
+        # the cash leg. Per-unit cost syntax ({price USD}) drifts for derived
+        # prices and large fractional quantities because Beancount recomputes
+        # qty × rounded-price, which need not equal the reported amount.
+        # Derive the lot cost from qty × price, but never let it exceed the
+        # reported cash outflow: when the computed cost is unusable (≤ 0) or
+        # larger than reported (which would otherwise leave a dropped negative
+        # fee and an unbalanced entry), fall back to the full reported amount and
+        # record no fee. Any positive remainder becomes an Expenses:Fees posting.
         calculated_cost = round(qty * price, 2) if price > 0 and qty > 0 else 0.0
-        fee = round(reported_amount - calculated_cost, 2) if calculated_cost > 0 else 0.0
+        if calculated_cost <= 0 or calculated_cost > reported_amount:
+            lot_cost = reported_amount
+            fee = 0.0
+        else:
+            lot_cost = calculated_cost
+            fee = round(reported_amount - calculated_cost, 2)
         # Reinvested dividends are funded by dividend income, not by brokerage cash;
         # routing them through the cash-outflow leg would wrongly drain USD and omit
         # the dividend income.
@@ -1529,7 +1545,7 @@ class BeancountGenerator:
         )
         lines.append(
             f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
-            f"{{{_format_price(price)} USD}}\n"
+            f"{{{{{_format_cost(lot_cost)} USD}}}}\n"
         )
         lines.append(f"  {funding_account:<36} {-reported_amount:>8.2f} USD\n")
         if fee > 0:
@@ -1697,6 +1713,11 @@ class BeancountGenerator:
             if (holdings_path.exists() and append)
             else None
         )
+        # Reconstructed opening lots are derived from transactions too, so emit
+        # the holdings section whenever holdings exist *or* there are trades —
+        # otherwise sells would reduce an empty inventory and the ledger fails to
+        # load. Price points remain gated on a holdings snapshot elsewhere.
+        has_txns = bool(transactions and transactions.transactions)
         holdings_content = (
             self.generate_holdings_bean(
                 holdings,
@@ -1705,7 +1726,7 @@ class BeancountGenerator:
                 existing_content=existing_h_text,
                 opening_date=effective_opening_date,
             )
-            if holdings
+            if (holdings or has_txns)
             else ""
         )
         if holdings_path.exists() and append:
@@ -1805,8 +1826,11 @@ class BeancountGenerator:
             delta_chunks.append(self.generate_balances_bean(balances, holdings, transactions=transactions))
             delta_chunks.append("\n")
 
-        # Append commodity holdings lots and price points if available
-        if holdings:
+        # Append commodity holdings lots when holdings exist or transactions
+        # imply lots to reconstruct (so appended sells resolve against a
+        # non-empty inventory). Price points stay gated on a holdings snapshot —
+        # there are no market prices to emit without one.
+        if holdings or (transactions and transactions.transactions):
             delta_chunks.append(
                 self.generate_holdings_bean(
                     holdings,
@@ -1817,6 +1841,7 @@ class BeancountGenerator:
                 )
             )
             delta_chunks.append("\n")
+        if holdings:
             delta_chunks.append(self.generate_prices_bean(holdings))
             delta_chunks.append("\n")
 

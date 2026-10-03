@@ -920,8 +920,12 @@ def _render_beancount(args, balances_res, holdings_res, transactions_res) -> Non
     output_parts.append(generator.generate_accounts_bean(balances_res, holdings_res, transactions_res))
     if balances_res or holdings_res:
         output_parts.append(generator.generate_balances_bean(balances_res, holdings_res, transactions=transactions_res))
-    if holdings_res:
+    # Emit the holdings section when holdings exist or transactions imply lots to
+    # reconstruct, so streamed sells resolve against a non-empty inventory. Price
+    # points stay gated on a holdings snapshot (no snapshot, no market prices).
+    if holdings_res or (transactions_res and transactions_res.transactions):
         output_parts.append(generator.generate_holdings_bean(holdings_res, balances=balances_res, transactions=transactions_res, opening_date=args.opening_date))
+    if holdings_res:
         output_parts.append(generator.generate_prices_bean(holdings_res))
     if transactions_res:
         output_parts.append(generator.generate_transactions_bean(transactions_res, balances=balances_res))
