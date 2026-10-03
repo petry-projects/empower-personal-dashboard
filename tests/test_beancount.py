@@ -452,6 +452,28 @@ class TestBeancountGenerator(unittest.TestCase):
             transactions=[{"transaction_date": "2019-03-10", "amount": 1.0}],
         )
         self.assertEqual(_determine_opening_date(old_txs), "2019-03-09")
+        # Earliest trade exactly on clamp anchor 2020-01-01: yields 2019-12-31
+        clamp_anchor_txs = DashboardTransactions(
+            start_date="2020-01-01",
+            end_date="2020-01-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[{"transaction_date": "2020-01-01", "amount": 1.0}],
+        )
+        self.assertEqual(_determine_opening_date(clamp_anchor_txs), "2019-12-31")
+        # Month-boundary rollover: 2020-03-01 yields 2020-02-29, clamped to 2020-01-01
+        month_boundary_txs = DashboardTransactions(
+            start_date="2020-03-01",
+            end_date="2020-03-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[{"transaction_date": "2020-03-01", "amount": 1.0}],
+        )
+        self.assertEqual(_determine_opening_date(month_boundary_txs), "2020-01-01")
 
     def test_credit_card_types_slugify_as_liabilities(self):
         self.assertEqual(slugify_account_name("Chase", "Sapphire", "credit_card"), "Liabilities:Chase:Sapphire")
