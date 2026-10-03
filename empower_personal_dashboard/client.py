@@ -65,6 +65,59 @@ def _env_flag(value: Optional[str]) -> bool:
     return value.strip().lower() not in _FALSY_ENV_VALUES
 
 
+def _clean_history_balances(raw_balances: Any) -> Dict[str, float]:
+    """Sanitize a raw per-account balances map, dropping textual annotation siblings."""
+    clean_balances: Dict[str, float] = {}
+    if isinstance(raw_balances, dict):
+        for k, v in raw_balances.items():
+            if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
+                clean_balances[clean_api_text(k)] = float(v)
+    return clean_balances
+
+
+def _normalize_history_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a single raw history entry into the dashboard payload shape.
+
+    Returns the normalized dict, or None if the entry should be skipped
+    (i.e. its sanitized date is empty).
+    """
+    # Textual history fields may carry upstream mojibake; sanitize the
+    # date and account-balance keys before they enter the payload.
+    date_str = clean_api_text(entry.get("date"))
+    if not date_str:
+        return None
+
+    total_assets = entry.get("totalAssets")
+    if total_assets is None:
+        total_assets = entry.get("aggregateBalance")
+
+    clean_balances = _clean_history_balances(entry.get("balances", {}))
+
+    if total_assets is None and clean_balances:
+        # Sum only positive balances: negative entries are liability
+        # accounts, and including them would yield net worth rather than
+        # total assets (and double-count liabilities in net_worth below).
+        total_assets = sum(v for v in clean_balances.values() if v > 0)
+
+    total_assets_val = float(total_assets or 0.0)
+    total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
+    if entry.get("totalLiabilities") is None and clean_balances:
+        total_liab_val = sum(-v for v in clean_balances.values() if v < 0)
+    net_worth_val = (
+        float(entry.get("netWorth"))
+        if entry.get("netWorth") is not None
+        else (total_assets_val - total_liab_val)
+    )
+
+    return {
+        "date": date_str,
+        "net_worth": net_worth_val,
+        "total_assets": total_assets_val,
+        "total_liabilities": total_liab_val,
+        "balances": clean_balances,
+    }
+
+
 class EmpowerDashboardClient:
     """Client for interacting with Empower Personal Dashboard API."""
 
@@ -690,46 +743,10 @@ class EmpowerDashboardClient:
 
             normalized_histories = []
             for entry in raw_hist:
-                # Textual history fields may carry upstream mojibake; sanitize the
-                # date and account-balance keys before they enter the payload.
-                date_str = clean_api_text(entry.get("date"))
-                if not date_str:
+                normalized_entry = _normalize_history_entry(entry)
+                if normalized_entry is None:
                     continue
-
-                total_assets = entry.get("totalAssets")
-                if total_assets is None:
-                    total_assets = entry.get("aggregateBalance")
-
-                raw_balances = entry.get("balances", {})
-                clean_balances: Dict[str, float] = {}
-                if isinstance(raw_balances, dict):
-                    for k, v in raw_balances.items():
-                        if not str(k).endswith("Annotation") and isinstance(v, (int, float)):
-                            clean_balances[clean_api_text(k)] = float(v)
-
-                if total_assets is None and clean_balances:
-                    # Sum only positive balances: negative entries are liability
-                    # accounts, and including them would yield net worth rather than
-                    # total assets (and double-count liabilities in net_worth below).
-                    total_assets = sum(v for v in clean_balances.values() if v > 0)
-
-                total_assets_val = float(total_assets or 0.0)
-                total_liab_val = abs(float(entry.get("totalLiabilities") or 0.0))
-                if entry.get("totalLiabilities") is None and clean_balances:
-                    total_liab_val = sum(-v for v in clean_balances.values() if v < 0)
-                net_worth_val = (
-                    float(entry.get("netWorth"))
-                    if entry.get("netWorth") is not None
-                    else (total_assets_val - total_liab_val)
-                )
-
-                normalized_histories.append({
-                    "date": date_str,
-                    "net_worth": net_worth_val,
-                    "total_assets": total_assets_val,
-                    "total_liabilities": total_liab_val,
-                    "balances": clean_balances,
-                })
+                normalized_histories.append(normalized_entry)
         except SessionExpiredError:
             raise
         except Exception as e:

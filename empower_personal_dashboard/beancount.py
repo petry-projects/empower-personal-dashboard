@@ -32,6 +32,26 @@ BEANCOUNT_ACCOUNT_REGEX = re.compile(
     r"(:[A-Z0-9][A-Za-z0-9\-]*)*$"
 )
 
+# Canonical Beancount account names reused across multiple generators.
+ACCT_OPENING_BALANCES = "Equity:Opening-Balances"
+ACCT_INCOME_DIVIDENDS = "Income:Dividends"
+ACCT_INCOME_CAPITAL_GAINS = "Income:CapitalGains"
+ACCT_EXPENSES_FEES = "Expenses:Fees"
+
+# Default firm / account identity fallbacks used when upstream data is missing.
+_FIRM_INSTITUTION = "Institution"
+_FIRM_BROKERAGE = "Brokerage"
+_ACCOUNT_DEFAULT_NAME = "Account"
+_ACCOUNT_TYPE_BANK = "bank"
+_ACCOUNT_TYPE_INVESTMENT = "investment"
+
+# Account-type keywords that indicate a commodity-bearing investment account,
+# whose `open` directive is left currency-unconstrained.
+_INVESTMENT_ACCOUNT_WORDS = (
+    "invest", "broker", "ira", "401k", "roth", "rollover",
+    "stock", "portfolio", "529", "other",
+)
+
 
 def _clean_segment(text: str) -> str:
     """Normalize and format a text string into a valid Beancount account subsegment."""
@@ -261,9 +281,9 @@ def _is_investment_tx(transaction: Dict[str, Any]) -> bool:
 def _resolve_account_from_tx(
     transaction: Dict[str, Any],
     acct_lookup: Dict[str, Dict[str, Any]],
-    default_firm: str = "Institution",
-    default_type: str = "bank",
-    default_name: str = "Account",
+    default_firm: str = _FIRM_INSTITUTION,
+    default_type: str = _ACCOUNT_TYPE_BANK,
+    default_name: str = _ACCOUNT_DEFAULT_NAME,
 ) -> Tuple[str, str, str, str]:
     """Resolve account details from transaction and lookup table.
 
@@ -280,9 +300,9 @@ def _resolve_account_from_tx(
     t_name = transaction.get("account_name") or ""
 
     if _is_investment_tx(transaction):
-        default_firm = "Brokerage"
-        default_type = "investment"
-        default_name = "Brokerage"
+        default_firm = _FIRM_BROKERAGE
+        default_type = _ACCOUNT_TYPE_INVESTMENT
+        default_name = _FIRM_BROKERAGE
 
     acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
     if acct_info:
@@ -297,6 +317,49 @@ def _resolve_account_from_tx(
         resolved_id = aid
 
     return firm, acct_name, acct_type, resolved_id
+
+
+def _resolve_account_from_holding(
+    holding: Dict[str, Any],
+    acct_lookup: Dict[str, Dict[str, Any]],
+) -> Tuple[str, str, str, str]:
+    """Resolve (firm, account_name, account_type, account_id) for a holding.
+
+    Mirrors the account resolution used across accounts, balances, and holdings
+    generation so a single position maps to one consistent brokerage account.
+    """
+    uaid = str(holding.get("user_account_id") or "")
+    h_name = holding.get("account_name") or ""
+    acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
+    if acct_info:
+        firm = acct_info.get("firm_name") or _FIRM_BROKERAGE
+        acct_name = acct_info.get("account_name") or h_name or _FIRM_BROKERAGE
+        acct_type = acct_info.get("account_type") or _ACCOUNT_TYPE_INVESTMENT
+        acct_id = str(acct_info.get("account_id") or uaid)
+    else:
+        firm = holding.get("firm_name") or _FIRM_BROKERAGE
+        acct_name = h_name or _FIRM_BROKERAGE
+        acct_type = _ACCOUNT_TYPE_INVESTMENT
+        acct_id = uaid
+    return firm, acct_name, acct_type, acct_id
+
+
+def _is_investment_account_type(acct_type: Any) -> bool:
+    """True when an account type string denotes a commodity-bearing investment account."""
+    type_lower = str(acct_type).lower()
+    return any(word in type_lower for word in _INVESTMENT_ACCOUNT_WORDS)
+
+
+def _balance_account_fields(acct: Dict[str, Any]) -> Tuple[str, str, str, str, str, float]:
+    """Extract (firm, name, account_id, account_type, currency, balance) from a balances account."""
+    return (
+        acct.get("firm_name") or _FIRM_INSTITUTION,
+        acct.get("account_name") or _ACCOUNT_DEFAULT_NAME,
+        str(acct.get("account_id") or ""),
+        acct.get("account_type") or _ACCOUNT_TYPE_BANK,
+        acct.get("currency") or "USD",
+        float(acct.get("balance", 0.0)),
+    )
 
 
 class BeancountMapper:
@@ -560,6 +623,57 @@ def _ensure_fifo_booking_method(content: str) -> str:
     return option_line + content
 
 
+def _prepare_ledger_path(filepath: Union[str, Path], *, is_dir: bool) -> Path:
+    """Resolve and validate a user-supplied ledger path before any write.
+
+    Guards against path-injection: rejects embedded NUL bytes in the raw input
+    and refuses to follow a symlink at the resolved location (which could redirect
+    the write outside the intended target). Returns the resolved absolute path.
+    """
+    raw = str(filepath)
+    if "\x00" in raw:
+        raise ValueError("Ledger path must not contain NUL bytes.")
+    resolved = Path(filepath).expanduser().resolve()
+    if resolved.is_symlink():
+        kind = "directory" if is_dir else "target file"
+        raise ValueError(f"Refusing to write to symlinked {kind}: {resolved}")
+    return resolved
+
+
+def _verify_not_symlink(p: Path) -> None:
+    """Refuse to write through a symlinked ledger component file."""
+    if p.is_symlink():
+        raise ValueError(f"Refusing to write to symlinked ledger target: {p}")
+
+
+def _strip_bean_header(text: str) -> str:
+    """Return ``text`` with its leading comment header (up to the first blank line) removed."""
+    body_start = text.find("\n\n")
+    return text[body_start + 2:] if body_start != -1 else text
+
+
+def _build_delta_transactions(
+    transactions: DashboardTransactions,
+    existing_ids: Set[str],
+) -> Optional[DashboardTransactions]:
+    """Build a container of transactions whose ids are not already present, or None if none are new."""
+    new_txs = [
+        t for t in transactions.transactions
+        if str(t.get("user_transaction_id") or "") not in existing_ids
+    ]
+    if not new_txs:
+        return None
+    return DashboardTransactions(
+        start_date=transactions.start_date,
+        end_date=transactions.end_date,
+        total_transactions=len(new_txs),
+        money_in=transactions.money_in,
+        money_out=transactions.money_out,
+        net_cashflow=transactions.net_cashflow,
+        transactions=new_txs,
+    )
+
+
 class BeancountGenerator:
     """Generates Beancount directives and ledger files from Empower data models."""
 
@@ -618,111 +732,142 @@ class BeancountGenerator:
             "Income:Dividends",
         }
         acct_lookup = _build_account_lookup(balances)
+        commodity_accounts = self._collect_commodity_accounts(holdings, acct_lookup)
 
-        # Collect accounts that hold commodities from holdings
+        # 1. Accounts from balances
+        self._open_accounts_from_balances(
+            balances, commodity_accounts, seen_accounts, lines, include_pads
+        )
+        # 2. Accounts from holdings
+        self._open_accounts_from_holdings(
+            holdings, acct_lookup, seen_accounts, lines, include_pads
+        )
+        # 3. Accounts from transactions
+        self._open_accounts_from_transactions(
+            transactions, acct_lookup, commodity_accounts, seen_accounts, lines
+        )
+        # 4 & 5. Custom/regex mapped accounts and transaction-derived categories
+        self._open_custom_and_regex_accounts(seen_accounts, lines)
+        self._open_category_accounts_from_transactions(transactions, seen_accounts, lines)
+
+        return "".join(lines)
+
+    def _collect_commodity_accounts(
+        self,
+        holdings: Optional[DashboardHoldings],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Set[str]:
+        """Resolve the set of Beancount accounts that hold investment commodities."""
         commodity_accounts: Set[str] = set()
         if holdings and holdings.holdings:
             for h in holdings.holdings:
-                uaid = str(h.get("user_account_id") or "")
-                h_name = h.get("account_name") or ""
-                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-                if acct_info:
-                    h_firm = acct_info.get("firm_name") or "Brokerage"
-                    acct_name = acct_info.get("account_name") or h_name or "Brokerage"
-                    h_type = acct_info.get("account_type") or "investment"
-                    h_id = str(acct_info.get("account_id") or uaid)
-                else:
-                    h_firm = h.get("firm_name") or "Brokerage"
-                    acct_name = h_name or "Brokerage"
-                    h_type = "investment"
-                    h_id = uaid
-                b_acct = self.mapper.resolve_account(h_firm, acct_name, h_id, h_type, is_asset=True)
-                commodity_accounts.add(b_acct)
-
-        # 1. Accounts from balances
-        if balances and balances.accounts:
-            for acct in balances.accounts:
-                firm = acct.get("firm_name") or "Institution"
-                name = acct.get("account_name") or "Account"
-                acct_id = str(acct.get("account_id") or "")
-                acct_type = acct.get("account_type") or "bank"
-                curr = acct.get("currency") or "USD"
-                raw_bal = float(acct.get("balance", 0.0))
-
-                b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
-                if b_account not in seen_accounts:
-                    seen_accounts.add(b_account)
-                    if b_account in commodity_accounts or any(
-                        inv_word in str(acct_type).lower()
-                        for inv_word in ("invest", "broker", "ira", "401k", "roth", "rollover", "stock", "portfolio", "529", "other")
-                    ):
-                        lines.append(f"2000-01-01 open {b_account}\n")
-                    else:
-                        lines.append(f"2000-01-01 open {b_account} {curr}\n")
-                    if abs(raw_bal) > 0.001 and include_pads:
-                        lines.append(f"2000-01-01 pad {b_account} Equity:Opening-Balances\n")
-
-        # 2. Accounts from holdings
-        if holdings and holdings.holdings:
-            for h in holdings.holdings:
-                uaid = str(h.get("user_account_id") or "")
-                h_name = h.get("account_name") or ""
-                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-                if acct_info:
-                    firm = acct_info.get("firm_name") or "Brokerage"
-                    name = acct_info.get("account_name") or h_name or "Brokerage"
-                    acct_type = acct_info.get("account_type") or "investment"
-                    acct_id = str(acct_info.get("account_id") or uaid)
-                else:
-                    firm = h.get("firm_name") or "Brokerage"
-                    name = h_name or "Brokerage"
-                    acct_type = "investment"
-                    acct_id = uaid
-
-                b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
-                if b_account not in seen_accounts:
-                    seen_accounts.add(b_account)
-                    lines.append(f"2000-01-01 open {b_account}\n")
-                    if include_pads:
-                        lines.append(f"2000-01-01 pad {b_account} Equity:Opening-Balances\n")
-
-        # 3. Accounts from transactions
-        if transactions and transactions.transactions:
-            # Pre-pass: identify transaction accounts that receive commodity
-            # (ticker) postings, so their `open` is left currency-unconstrained.
-            commodity_tx_accounts: Set[str] = set()
-            for tx in transactions.transactions:
-                if not _clean_ticker(tx.get("symbol")):
-                    continue
-                tt = clean_api_text(tx.get("transaction_type") or "").strip().lower()
-                it = clean_api_text(tx.get("investment_type") or "").strip().lower()
-                if not (
-                    tt in ("buy", "sell", "reinvest", "disposal")
-                    or it in ("buy", "sell", "reinvest", "disposal")
-                ):
-                    continue
-                firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
-                commodity_tx_accounts.add(
-                    self.mapper.resolve_account(firm, name, resolved_id, acct_type)
+                firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
+                commodity_accounts.add(
+                    self.mapper.resolve_account(firm, acct_name, acct_id, acct_type)
                 )
+        return commodity_accounts
 
-            for tx in transactions.transactions:
-                firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
+    def _open_accounts_from_balances(
+        self,
+        balances: Optional[DashboardBalances],
+        commodity_accounts: Set[str],
+        seen_accounts: Set[str],
+        lines: List[str],
+        include_pads: bool,
+    ) -> None:
+        if not (balances and balances.accounts):
+            return
+        for acct in balances.accounts:
+            firm, name, acct_id, acct_type, curr, raw_bal = _balance_account_fields(acct)
 
-                b_account = self.mapper.resolve_account(firm, name, resolved_id, acct_type)
-                if b_account not in seen_accounts:
-                    seen_accounts.add(b_account)
-                    # Investment accounts may hold ticker commodities, so leave
-                    # them currency-unconstrained; cash-only accounts stay USD.
-                    if b_account in commodity_accounts or b_account in commodity_tx_accounts or any(
-                        inv_word in str(acct_type).lower()
-                        for inv_word in ("invest", "broker", "ira", "401k", "roth", "rollover", "stock", "portfolio", "529", "other")
-                    ):
-                        lines.append(f"2000-01-01 open {b_account}\n")
-                    else:
-                        lines.append(f"2000-01-01 open {b_account} USD\n")
+            b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
+            if b_account in seen_accounts:
+                continue
+            seen_accounts.add(b_account)
+            if b_account in commodity_accounts or _is_investment_account_type(acct_type):
+                lines.append(f"2000-01-01 open {b_account}\n")
+            else:
+                lines.append(f"2000-01-01 open {b_account} {curr}\n")
+            if abs(raw_bal) > 0.001 and include_pads:
+                lines.append(f"2000-01-01 pad {b_account} {ACCT_OPENING_BALANCES}\n")
 
-        # 4. Open any custom mapped accounts, categories, and regex rule accounts
+    def _open_accounts_from_holdings(
+        self,
+        holdings: Optional[DashboardHoldings],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        seen_accounts: Set[str],
+        lines: List[str],
+        include_pads: bool,
+    ) -> None:
+        if not (holdings and holdings.holdings):
+            return
+        for h in holdings.holdings:
+            firm, name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
+            b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
+            if b_account in seen_accounts:
+                continue
+            seen_accounts.add(b_account)
+            lines.append(f"2000-01-01 open {b_account}\n")
+            if include_pads:
+                lines.append(f"2000-01-01 pad {b_account} {ACCT_OPENING_BALANCES}\n")
+
+    def _collect_commodity_tx_accounts(
+        self,
+        transactions: DashboardTransactions,
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Set[str]:
+        """Resolve transaction accounts that receive commodity (ticker) postings."""
+        commodity_tx_accounts: Set[str] = set()
+        for tx in transactions.transactions:
+            if not _clean_ticker(tx.get("symbol")):
+                continue
+            tt = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+            it = clean_api_text(tx.get("investment_type") or "").strip().lower()
+            if not (
+                tt in ("buy", "sell", "reinvest", "disposal")
+                or it in ("buy", "sell", "reinvest", "disposal")
+            ):
+                continue
+            firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
+            commodity_tx_accounts.add(
+                self.mapper.resolve_account(firm, name, resolved_id, acct_type)
+            )
+        return commodity_tx_accounts
+
+    def _open_accounts_from_transactions(
+        self,
+        transactions: Optional[DashboardTransactions],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        commodity_accounts: Set[str],
+        seen_accounts: Set[str],
+        lines: List[str],
+    ) -> None:
+        if not (transactions and transactions.transactions):
+            return
+        commodity_tx_accounts = self._collect_commodity_tx_accounts(transactions, acct_lookup)
+        for tx in transactions.transactions:
+            firm, name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
+            b_account = self.mapper.resolve_account(firm, name, resolved_id, acct_type)
+            if b_account in seen_accounts:
+                continue
+            seen_accounts.add(b_account)
+            # Investment accounts may hold ticker commodities, so leave them
+            # currency-unconstrained; cash-only accounts stay USD.
+            if (
+                b_account in commodity_accounts
+                or b_account in commodity_tx_accounts
+                or _is_investment_account_type(acct_type)
+            ):
+                lines.append(f"2000-01-01 open {b_account}\n")
+            else:
+                lines.append(f"2000-01-01 open {b_account} USD\n")
+
+    def _open_custom_and_regex_accounts(
+        self,
+        seen_accounts: Set[str],
+        lines: List[str],
+    ) -> None:
+        """Open custom mapped accounts, categories, and regex rule accounts."""
         for custom_acct in self.mapper.accounts.values():
             if custom_acct not in seen_accounts:
                 seen_accounts.add(custom_acct)
@@ -739,23 +884,28 @@ class BeancountGenerator:
                 seen_accounts.add(r_acct)
                 lines.append(f"2000-01-01 open {r_acct}\n")
 
-        # 5. Open any category / balancing accounts resolved from transactions
-        if transactions and transactions.transactions:
-            for tx in transactions.transactions:
-                cat_acct = self.mapper.resolve_category_or_payee(
-                    category=tx.get("category_name"),
-                    description=tx.get("description"),
-                    is_spending=bool(tx.get("is_spending", False)),
-                    is_income=bool(tx.get("is_income", False)),
-                    category_id=tx.get("category_id"),
-                    transaction_type=tx.get("transaction_type"),
-                    memo=tx.get("original_description"),
-                )
-                if cat_acct and cat_acct not in seen_accounts:
-                    seen_accounts.add(cat_acct)
-                    lines.append(f"2000-01-01 open {cat_acct}\n")
-
-        return "".join(lines)
+    def _open_category_accounts_from_transactions(
+        self,
+        transactions: Optional[DashboardTransactions],
+        seen_accounts: Set[str],
+        lines: List[str],
+    ) -> None:
+        """Open category / balancing accounts resolved from transactions."""
+        if not (transactions and transactions.transactions):
+            return
+        for tx in transactions.transactions:
+            cat_acct = self.mapper.resolve_category_or_payee(
+                category=tx.get("category_name"),
+                description=tx.get("description"),
+                is_spending=bool(tx.get("is_spending", False)),
+                is_income=bool(tx.get("is_income", False)),
+                category_id=tx.get("category_id"),
+                transaction_type=tx.get("transaction_type"),
+                memo=tx.get("original_description"),
+            )
+            if cat_acct and cat_acct not in seen_accounts:
+                seen_accounts.add(cat_acct)
+                lines.append(f"2000-01-01 open {cat_acct}\n")
 
     def generate_balances_bean(
         self,
@@ -771,96 +921,85 @@ class BeancountGenerator:
         ]
 
         acct_lookup = _build_account_lookup(balances)
+        commodity_accounts = self._collect_commodity_accounts(holdings, acct_lookup)
 
-        # Collect accounts that hold commodities from holdings
-        commodity_accounts: Set[str] = set()
-        if holdings and holdings.holdings:
-            for h in holdings.holdings:
-                uaid = str(h.get("user_account_id") or "")
-                h_name = h.get("account_name") or ""
-                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-                if acct_info:
-                    h_firm = acct_info.get("firm_name") or "Brokerage"
-                    acct_name = acct_info.get("account_name") or h_name or "Brokerage"
-                    h_type = acct_info.get("account_type") or "investment"
-                    h_id = str(acct_info.get("account_id") or uaid)
-                else:
-                    h_firm = h.get("firm_name") or "Brokerage"
-                    acct_name = h_name or "Brokerage"
-                    h_type = "investment"
-                    h_id = uaid
-                b_acct = self.mapper.resolve_account(h_firm, acct_name, h_id, h_type, is_asset=True)
-                commodity_accounts.add(b_acct)
-
-        tx_totals = _calculate_account_transaction_totals(transactions, self.mapper, acct_lookup) if transactions else {}
-
-        if balances and balances.accounts:
-            as_of = balances.as_of_date
-            lines.append(f";; Cash & Liability Balances (as of {as_of})\n")
-            for acct in balances.accounts:
-                firm = acct.get("firm_name") or "Institution"
-                name = acct.get("account_name") or "Account"
-                acct_id = str(acct.get("account_id") or "")
-                acct_type = acct.get("account_type") or "bank"
-                is_asset = acct.get("is_asset", True)
-                curr = acct.get("currency") or "USD"
-                raw_bal = float(acct.get("balance", 0.0))
-
-                b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
-                # If account holds commodities, its total balance is portfolio value rather than USD cash.
-                # Commodity positions are asserted separately below to avoid double-counting.
-                if b_account in commodity_accounts:
-                    continue
-
-                # In Beancount, liabilities (credit cards, loans, mortgages) are represented as negative balances
-                bal_amt = raw_bal if is_asset else -abs(raw_bal)
-                accumulated = tx_totals.get(b_account, 0.0) if transactions else 0.0
-                diff = bal_amt - accumulated
-                if abs(diff) > 0.005:
-                    lines.append(f"2020-01-01 pad {b_account} Equity:Opening-Balances\n")
-                lines.append(f"{as_of} balance {b_account} {bal_amt:.2f} {curr}\n")
-
-        if holdings and holdings.holdings:
-            as_of = holdings.as_of_date
-            # Beancount evaluates balance directives at the beginning of the day,
-            # so a trade dated on as_of has not yet posted when an assertion dated
-            # as_of is checked. Asserting the snapshot on the following day counts
-            # all same-day activity and keeps the reconstructed inventory exact.
-            try:
-                assert_date = (
-                    datetime.date.fromisoformat(as_of) + datetime.timedelta(days=1)
-                ).isoformat()
-            except Exception:
-                assert_date = as_of
-            lines.append(f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, asserted {assert_date})\n")
-            # Aggregate positions by (b_account, ticker) to avoid duplicate conflicting balance assertions
-            holding_units: Dict[Tuple[str, str], float] = {}
-            for h in holdings.holdings:
-                ticker = _clean_ticker(h.get("ticker"))
-                qty = float(h.get("quantity") or 0.0)
-                uaid = str(h.get("user_account_id") or "")
-                h_name = h.get("account_name") or ""
-
-                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-                if acct_info:
-                    firm = acct_info.get("firm_name") or "Brokerage"
-                    acct_name = acct_info.get("account_name") or h_name or "Brokerage"
-                    acct_type = acct_info.get("account_type") or "investment"
-                    acct_id = str(acct_info.get("account_id") or uaid)
-                else:
-                    firm = h.get("firm_name") or "Brokerage"
-                    acct_name = h_name or "Brokerage"
-                    acct_type = "investment"
-                    acct_id = uaid
-
-                if ticker and qty > 0:
-                    b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
-                    holding_units[(b_account, ticker)] = holding_units.get((b_account, ticker), 0.0) + qty
-
-            for (b_account, ticker), total_qty in sorted(holding_units.items()):
-                lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
+        self._emit_cash_liability_assertions(
+            balances, transactions, acct_lookup, commodity_accounts, lines
+        )
+        self._emit_commodity_unit_assertions(holdings, acct_lookup, lines)
 
         return "".join(lines)
+
+    def _emit_cash_liability_assertions(
+        self,
+        balances: Optional[DashboardBalances],
+        transactions: Optional[DashboardTransactions],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        commodity_accounts: Set[str],
+        lines: List[str],
+    ) -> None:
+        """Emit cash and liability balance assertions (and corrective pads)."""
+        if not (balances and balances.accounts):
+            return
+        tx_totals = (
+            _calculate_account_transaction_totals(transactions, self.mapper, acct_lookup)
+            if transactions
+            else {}
+        )
+        as_of = balances.as_of_date
+        lines.append(f";; Cash & Liability Balances (as of {as_of})\n")
+        for acct in balances.accounts:
+            firm, name, acct_id, acct_type, curr, raw_bal = _balance_account_fields(acct)
+            is_asset = acct.get("is_asset", True)
+
+            b_account = self.mapper.resolve_account(firm, name, acct_id, acct_type)
+            # If account holds commodities, its total balance is portfolio value rather than USD cash.
+            # Commodity positions are asserted separately below to avoid double-counting.
+            if b_account in commodity_accounts:
+                continue
+
+            # In Beancount, liabilities (credit cards, loans, mortgages) are represented as negative balances
+            bal_amt = raw_bal if is_asset else -abs(raw_bal)
+            accumulated = tx_totals.get(b_account, 0.0) if transactions else 0.0
+            diff = bal_amt - accumulated
+            if abs(diff) > 0.005:
+                lines.append(f"2020-01-01 pad {b_account} {ACCT_OPENING_BALANCES}\n")
+            lines.append(f"{as_of} balance {b_account} {bal_amt:.2f} {curr}\n")
+
+    def _emit_commodity_unit_assertions(
+        self,
+        holdings: Optional[DashboardHoldings],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        lines: List[str],
+    ) -> None:
+        """Emit aggregated per-(account, ticker) commodity unit balance assertions."""
+        if not (holdings and holdings.holdings):
+            return
+        as_of = holdings.as_of_date
+        # Beancount evaluates balance directives at the beginning of the day,
+        # so a trade dated on as_of has not yet posted when an assertion dated
+        # as_of is checked. Asserting the snapshot on the following day counts
+        # all same-day activity and keeps the reconstructed inventory exact.
+        try:
+            assert_date = (
+                datetime.date.fromisoformat(as_of) + datetime.timedelta(days=1)
+            ).isoformat()
+        except Exception:
+            assert_date = as_of
+        lines.append(f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, asserted {assert_date})\n")
+        # Aggregate positions by (b_account, ticker) to avoid duplicate conflicting balance assertions
+        holding_units: Dict[Tuple[str, str], float] = {}
+        for h in holdings.holdings:
+            ticker = _clean_ticker(h.get("ticker"))
+            qty = float(h.get("quantity") or 0.0)
+            if not (ticker and qty > 0):
+                continue
+            firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
+            b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
+            holding_units[(b_account, ticker)] = holding_units.get((b_account, ticker), 0.0) + qty
+
+        for (b_account, ticker), total_qty in sorted(holding_units.items()):
+            lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
 
     def generate_prices_bean(
         self,
@@ -901,26 +1040,10 @@ class BeancountGenerator:
             ";; ==============================================================================\n\n"
         ]
 
-        # Must reconstruct opening lots for fully-sold positions even if holdings snapshot is empty,
-        # or sells will reduce an empty inventory and the ledger will fail to load.
-        # Early return moved to end of function, after reconstruction setup.
-
-        as_of = holdings.as_of_date if holdings else None
-        effective_opening = opening_date or _determine_opening_date(transactions, balances, None)
-        if effective_opening:
-            lot_date = effective_opening
-        else:
-            # Date holdings snapshot transaction before the balance assertion date so Beancount's
-            # beginning-of-day balance assertion on as_of passes cleanly.
-            if as_of:
-                try:
-                    d = datetime.date.fromisoformat(as_of)
-                    lot_date = (d - datetime.timedelta(days=1)).isoformat()
-                except Exception:
-                    lot_date = as_of
-            else:
-                lot_date = "2020-01-01"
-
+        # Must reconstruct opening lots for fully-sold positions even if the holdings
+        # snapshot is empty, or sells will reduce an empty inventory and the ledger
+        # will fail to load. The emit helpers therefore run regardless of holdings.
+        lot_date = self._resolve_lot_date(holdings, opening_date, transactions, balances)
         acct_lookup = _build_account_lookup(balances)
 
         # Existing holding tags to skip on append
@@ -928,190 +1051,259 @@ class BeancountGenerator:
         if existing_content:
             existing_keys = set(re.findall(r'empower_holding:\s*"([^"]+)"', existing_content))
 
-        # Calculate net transaction buys per (b_account, ticker) across the transaction history
+        net_buys, net_buy_meta = self._compute_net_buys(transactions, acct_lookup)
+        aggregated_holdings = self._aggregate_snapshot_holdings(holdings, acct_lookup)
+
+        self._emit_snapshot_lots(
+            aggregated_holdings, net_buys, transactions, existing_keys, lot_date, lines
+        )
+        self._emit_reconstructed_opening_lots(
+            net_buys, net_buy_meta, aggregated_holdings, existing_keys, lot_date, transactions, lines
+        )
+
+        return "".join(lines)
+
+    def _resolve_lot_date(
+        self,
+        holdings: Optional[DashboardHoldings],
+        opening_date: Optional[str],
+        transactions: Optional[DashboardTransactions],
+        balances: Optional[DashboardBalances],
+    ) -> str:
+        """Determine the dated day used for reconstructed opening lots."""
+        effective_opening = opening_date or _determine_opening_date(transactions, balances, None)
+        if effective_opening:
+            return effective_opening
+        # Date the holdings snapshot a day before the balance assertion date so
+        # Beancount's beginning-of-day balance assertion on as_of passes cleanly.
+        as_of = holdings.as_of_date if holdings else None
+        if as_of:
+            try:
+                d = datetime.date.fromisoformat(as_of)
+                return (d - datetime.timedelta(days=1)).isoformat()
+            except Exception:
+                return as_of
+        return "2020-01-01"
+
+    def _compute_net_buys(
+        self,
+        transactions: Optional[DashboardTransactions],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Tuple[Dict[Tuple[str, str], float], Dict[Tuple[str, str], Dict[str, Any]]]:
+        """Net buy quantity and representative pricing per (account, ticker).
+
+        Returns ``(net_buys, net_buy_meta)``. ``net_buy_meta`` carries the firm
+        plus a representative price used to reconstruct synthetic opening lots
+        for securities fully sold within the transaction window.
+        """
         net_buys: Dict[Tuple[str, str], float] = {}
-        # Per-key metadata (firm + a representative price) used to reconstruct
-        # synthetic opening lots for securities fully sold within the window.
         net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        if transactions and transactions.transactions:
-            for tx in transactions.transactions:
-                sym = tx.get("symbol")
-                if not sym:
-                    continue
-                t_ticker = _clean_ticker(sym)
-                if not t_ticker:
-                    continue
+        if not (transactions and transactions.transactions):
+            return net_buys, net_buy_meta
 
-                tx_raw_qty = tx.get("quantity")
-                tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
-                if tx_qty <= 0:
-                    continue
+        for tx in transactions.transactions:
+            self._accumulate_net_buy(tx, acct_lookup, net_buys, net_buy_meta)
 
-                tx_raw_price = tx.get("price")
-                tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
+        return net_buys, net_buy_meta
 
-                aid = str(tx.get("account_id") or "")
-                uaid = str(tx.get("user_account_id") or "")
-                t_name = tx.get("account_name") or ""
-                acct_info = acct_lookup.get(aid) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
-                if acct_info:
-                    tx_firm = acct_info.get("firm_name") or "Brokerage"
-                    tx_acct_name = acct_info.get("account_name") or t_name or "Brokerage"
-                    tx_acct_type = acct_info.get("account_type") or "investment"
-                    tx_aid = str(acct_info.get("account_id") or aid)
-                else:
-                    tx_firm = tx.get("firm_name") or "Brokerage"
-                    tx_acct_name = t_name or "Brokerage"
-                    tx_acct_type = tx.get("account_type") or "investment"
-                    tx_aid = aid
+    def _accumulate_net_buy(
+        self,
+        tx: Dict[str, Any],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        net_buys: Dict[Tuple[str, str], float],
+        net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]],
+    ) -> None:
+        """Fold a single trade into the net-buys and opening-lot metadata maps."""
+        t_ticker = _clean_ticker(tx.get("symbol"))
+        tx_raw_qty = tx.get("quantity")
+        tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
+        if not t_ticker or tx_qty <= 0:
+            return
 
-                tx_b_account = self.mapper.resolve_account(tx_firm, tx_acct_name, tx_aid, account_type=tx_acct_type)
-                tx_type = clean_api_text(tx.get("transaction_type") or "").strip().lower()
-                inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
+        tx_type = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+        inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
+        is_tx_buy = tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest")
+        is_tx_sell = tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal")
+        if not (is_tx_buy or is_tx_sell):
+            return
 
-                key = (tx_b_account, t_ticker)
-                is_tx_buy = tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest")
-                is_tx_sell = tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal")
-                if is_tx_buy:
-                    net_buys[key] = net_buys.get(key, 0.0) + tx_qty
-                elif is_tx_sell:
-                    net_buys[key] = net_buys.get(key, 0.0) - tx_qty
+        tx_firm, tx_acct_name, tx_acct_type, tx_aid = _resolve_account_from_tx(tx, acct_lookup)
+        tx_b_account = self.mapper.resolve_account(
+            tx_firm, tx_acct_name, tx_aid, account_type=tx_acct_type
+        )
+        key = (tx_b_account, t_ticker)
+        net_buys[key] = net_buys.get(key, 0.0) + (tx_qty if is_tx_buy else -tx_qty)
 
-                if is_tx_buy or is_tx_sell:
-                    meta = net_buy_meta.setdefault(
-                        key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
-                    )
-                    if tx_price > 0:
-                        if meta.get("any_price", 0.0) <= 0:
-                            meta["any_price"] = tx_price
-                        if is_tx_buy and meta.get("buy_price", 0.0) <= 0:
-                            meta["buy_price"] = tx_price
+        tx_raw_price = tx.get("price")
+        tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
+        meta = net_buy_meta.setdefault(
+            key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
+        )
+        self._update_net_buy_meta(meta, tx_price, is_tx_buy)
 
-        # Aggregate positions by (b_account, ticker) to emit each snapshot position only once
-        aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    @staticmethod
+    def _update_net_buy_meta(meta: Dict[str, Any], tx_price: float, is_tx_buy: bool) -> None:
+        """Record the first positive price seen (and first buy price) for opening-lot reconstruction."""
+        if tx_price <= 0:
+            return
+        if meta.get("any_price", 0.0) <= 0:
+            meta["any_price"] = tx_price
+        if is_tx_buy and meta.get("buy_price", 0.0) <= 0:
+            meta["buy_price"] = tx_price
 
-        if holdings and holdings.holdings:
-            for h in holdings.holdings:
-                ticker = _clean_ticker(h.get("ticker"))
-                qty = float(h.get("quantity") or 0.0)
-                price = float(h.get("price") or 0.0)
-                cost_basis = h.get("cost_basis")
-                uaid = str(h.get("user_account_id") or "")
-                h_name = h.get("account_name") or ""
+    def _aggregate_snapshot_holdings(
+        self,
+        holdings: Optional[DashboardHoldings],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """Aggregate the holdings snapshot by (account, ticker), summing quantities and cost basis."""
+        aggregated: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        if not (holdings and holdings.holdings):
+            return aggregated
 
-                acct_info = acct_lookup.get(uaid) or acct_lookup.get(h_name)
-                if acct_info:
-                    firm = acct_info.get("firm_name") or "Brokerage"
-                    acct_name = acct_info.get("account_name") or h_name or "Brokerage"
-                    acct_type = acct_info.get("account_type") or "investment"
-                    acct_id = str(acct_info.get("account_id") or uaid)
-                else:
-                    firm = h.get("firm_name") or "Brokerage"
-                    acct_name = h_name or "Brokerage"
-                    acct_type = "investment"
-                    acct_id = uaid
+        for h in holdings.holdings:
+            ticker = _clean_ticker(h.get("ticker"))
+            qty = float(h.get("quantity") or 0.0)
+            if not (ticker and qty > 0):
+                continue
+            price = float(h.get("price") or 0.0)
+            cost_basis = h.get("cost_basis")
+            firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
+            b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
+            key = (b_account, ticker)
+            if key not in aggregated:
+                aggregated[key] = {
+                    "firm": firm,
+                    "b_account": b_account,
+                    "ticker": ticker,
+                    "quantity": qty,
+                    "price": price,
+                    "cost_basis": float(cost_basis) if cost_basis is not None else None,
+                }
+            else:
+                self._merge_holding(aggregated[key], qty, price, cost_basis)
+        return aggregated
 
-                if ticker and qty > 0:
-                    b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type)
-                    key = (b_account, ticker)
-                    if key not in aggregated_holdings:
-                        aggregated_holdings[key] = {
-                            "firm": firm,
-                            "b_account": b_account,
-                            "ticker": ticker,
-                            "quantity": qty,
-                            "price": price,
-                            "cost_basis": float(cost_basis) if cost_basis is not None else None,
-                        }
-                    else:
-                        agg = aggregated_holdings[key]
-                        agg["quantity"] = agg.get("quantity", 0.0) + qty
-                        if cost_basis is not None:
-                            curr_cb = agg.get("cost_basis") or 0.0
-                            agg["cost_basis"] = curr_cb + float(cost_basis)
-                        if price > 0:
-                            agg["price"] = price
+    @staticmethod
+    def _merge_holding(agg: Dict[str, Any], qty: float, price: float, cost_basis: Any) -> None:
+        """Fold an additional holding row of the same (account, ticker) into an aggregate."""
+        agg["quantity"] = agg.get("quantity", 0.0) + qty
+        if cost_basis is not None:
+            curr_cb = agg.get("cost_basis") or 0.0
+            agg["cost_basis"] = curr_cb + float(cost_basis)
+        if price > 0:
+            agg["price"] = price
 
-        for pos in sorted(aggregated_holdings.values(), key=lambda p: (p.get("b_account", ""), p.get("ticker", ""))):
+    def _emit_snapshot_lots(
+        self,
+        aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]],
+        net_buys: Dict[Tuple[str, str], float],
+        transactions: Optional[DashboardTransactions],
+        existing_keys: Set[str],
+        lot_date: str,
+        lines: List[str],
+    ) -> None:
+        """Emit the baseline opening lot for each snapshot position acquired before the window."""
+        has_tx = transactions is not None and bool(transactions.transactions)
+        for pos in sorted(
+            aggregated_holdings.values(),
+            key=lambda p: (p.get("b_account", ""), p.get("ticker", "")),
+        ):
             b_account = pos.get("b_account", "")
             ticker = pos.get("ticker", "")
-            firm = pos.get("firm", "Brokerage")
             snapshot_qty = pos.get("quantity", 0.0)
-            price = pos.get("price", 0.0)
-            cost_basis = pos.get("cost_basis")
-
             key = (b_account, ticker)
-            if transactions is not None and transactions.transactions:
-                nb = net_buys.get(key, 0.0)
-                baseline_qty = snapshot_qty - nb
-            else:
-                baseline_qty = snapshot_qty
-
-            # If Baseline Opening Qty <= 0: position was acquired entirely within transaction window
+            # Baseline Opening Qty = Current Snapshot Qty - Net Buys within window.
+            baseline_qty = snapshot_qty - net_buys.get(key, 0.0) if has_tx else snapshot_qty
+            # <= 0: position was acquired entirely within the transaction window.
             if baseline_qty <= 0.000001:
                 continue
+            holding_tag = f"{b_account}:{ticker}"
+            if holding_tag in existing_keys:
+                continue
+            self._append_snapshot_lot(
+                lines, lot_date, pos.get("firm", _FIRM_BROKERAGE), ticker, holding_tag,
+                b_account, baseline_qty, snapshot_qty, pos.get("price", 0.0), pos.get("cost_basis"),
+            )
 
+    def _append_snapshot_lot(
+        self,
+        lines: List[str],
+        lot_date: str,
+        firm: str,
+        ticker: str,
+        holding_tag: str,
+        b_account: str,
+        qty: float,
+        snapshot_qty: float,
+        price: float,
+        cost_basis: Optional[float],
+    ) -> None:
+        """Append a single snapshot opening-lot directive, scaling cost basis when present."""
+        payee_esc = _escape_beancount_string(f"{firm} Portfolio Snapshot")
+        narration_esc = _escape_beancount_string(f"{ticker} Position")
+        lines.append(f'{lot_date} * "{payee_esc}" "{narration_esc}"\n')
+        lines.append(f'  empower_holding: "{holding_tag}"\n')
+        if cost_basis is not None and float(cost_basis) > 0 and snapshot_qty > 0:
+            scaled_cost_basis = float(cost_basis) * qty / snapshot_qty
+            lines.append(
+                f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
+                f"{{{{{_format_cost(scaled_cost_basis)} USD}}}}\n"
+            )
+        else:
+            lines.append(
+                f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} @ {_format_price(price)} USD\n"
+            )
+        lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
+
+    def _emit_reconstructed_opening_lots(
+        self,
+        net_buys: Dict[Tuple[str, str], float],
+        net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]],
+        aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]],
+        existing_keys: Set[str],
+        lot_date: str,
+        transactions: Optional[DashboardTransactions],
+        lines: List[str],
+    ) -> None:
+        """Reconstruct opening lots for securities present before the window and fully sold within it.
+
+        Such a position is absent from the current holdings snapshot, yet its net
+        buys are negative; without a synthetic opening lot the reconstructed sales
+        would reduce an empty inventory and the historical ledger would fail to load.
+        """
+        if not (transactions is not None and transactions.transactions):
+            return
+        for key in sorted(net_buys):
+            if key in aggregated_holdings:
+                continue
+            nb = net_buys.get(key, 0.0)
+            if nb >= -0.000001:
+                continue
+            b_account, ticker = key
             holding_tag = f"{b_account}:{ticker}"
             if holding_tag in existing_keys:
                 continue
 
+            baseline_qty = -nb
+            meta = net_buy_meta.get(key, {})
+            firm = meta.get("firm") or _FIRM_BROKERAGE
+            opening_price = meta.get("buy_price") or meta.get("any_price") or 0.0
+
             payee_esc = _escape_beancount_string(f"{firm} Portfolio Snapshot")
-            narration_esc = _escape_beancount_string(f"{ticker} Position")
+            narration_esc = _escape_beancount_string(f"{ticker} Opening Position")
             lines.append(f'{lot_date} * "{payee_esc}" "{narration_esc}"\n')
             lines.append(f'  empower_holding: "{holding_tag}"\n')
-
-            qty = baseline_qty
-            if cost_basis is not None and float(cost_basis) > 0 and snapshot_qty > 0:
-                scaled_cost_basis = float(cost_basis) * qty / snapshot_qty
+            if opening_price > 0:
                 lines.append(
-                    f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
-                    f"{{{{{_format_cost(scaled_cost_basis)} USD}}}}\n"
+                    f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker} "
+                    f"{{{_format_cost(opening_price)} USD}}\n"
                 )
             else:
                 lines.append(
-                    f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} @ {_format_price(price)} USD\n"
+                    f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker}\n"
                 )
-            lines.append(f"  {'Equity:Opening-Balances':<36}\n\n")
-
-        # Reconstruct opening lots for securities that existed before the window
-        # and were fully sold within it. Such a position is absent from the
-        # current holdings snapshot, yet its net buys are negative; without a
-        # synthetic opening lot the reconstructed sales would reduce an empty
-        # inventory and the historical ledger would fail to load.
-        if transactions is not None and transactions.transactions:
-            for key in sorted(net_buys):
-                if key in aggregated_holdings:
-                    continue
-                nb = net_buys.get(key, 0.0)
-                if nb >= -0.000001:
-                    continue
-
-                b_account, ticker = key
-                holding_tag = f"{b_account}:{ticker}"
-                if holding_tag in existing_keys:
-                    continue
-
-                baseline_qty = -nb
-                meta = net_buy_meta.get(key, {})
-                firm = meta.get("firm") or "Brokerage"
-                opening_price = meta.get("buy_price") or meta.get("any_price") or 0.0
-
-                payee_esc = _escape_beancount_string(f"{firm} Portfolio Snapshot")
-                narration_esc = _escape_beancount_string(f"{ticker} Opening Position")
-                lines.append(f'{lot_date} * "{payee_esc}" "{narration_esc}"\n')
-                lines.append(f'  empower_holding: "{holding_tag}"\n')
-                if opening_price > 0:
-                    lines.append(
-                        f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker} "
-                        f"{{{_format_cost(opening_price)} USD}}\n"
-                    )
-                else:
-                    lines.append(
-                        f"  {b_account:<36} {_format_quantity(baseline_qty):>10} {ticker}\n"
-                    )
-                lines.append(f"  {'Equity:Opening-Balances':<36}\n\n")
-
-        return "".join(lines)
+            lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
 
     def generate_transactions_bean(
         self,
@@ -1131,189 +1323,292 @@ class BeancountGenerator:
         acct_lookup = _build_account_lookup(balances)
 
         for tx in transactions.transactions:
-            tx_id = str(tx.get("user_transaction_id") or "")
-            acct_id = str(tx.get("account_id") or "")
-            uaid = str(tx.get("user_account_id") or "")
-            t_name = tx.get("account_name") or ""
+            self._emit_transaction(tx, acct_lookup, lines)
 
-            # Resolve true account identity and type against balances lookup if available.
-            # Use _resolve_account_from_tx to ensure investment transactions consistently
-            # fall back to the brokerage identity (matching holdings reconciliation and
-            # assertions) so their postings reconcile in one account.
-            firm, acct_name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
-            acct_info = acct_lookup.get(acct_id) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
-            if acct_info:
-                is_asset = acct_info.get("is_asset", True)
-            else:
-                type_lower = acct_type.lower()
-                is_asset = not (
-                    "credit" in type_lower
-                    or "loan" in type_lower
-                    or "mortgage" in type_lower
-                    or "liabilit" in type_lower
-                )
+        return "".join(lines)
 
-            date = tx.get("transaction_date") or "2000-01-01"
-            cat_name = tx.get("category") or tx.get("category_name")
-            amount = abs(float(tx.get("amount") or 0.0))
+    def _emit_transaction(
+        self,
+        tx: Dict[str, Any],
+        acct_lookup: Dict[str, Dict[str, Any]],
+        lines: List[str],
+    ) -> None:
+        """Emit one transaction, dispatching to investment or standard handling."""
+        ctx = self._build_tx_context(tx, acct_lookup)
+        if ctx["is_buy"]:
+            self._emit_investment_buy(ctx, lines)
+        elif ctx["is_sell"]:
+            self._emit_investment_sell(ctx, lines)
+        elif ctx["is_dividend"]:
+            self._emit_investment_dividend(ctx, lines)
+        else:
+            self._emit_standard_tx(ctx, lines)
 
-            is_credit = bool(tx.get("is_credit"))
-            is_cash_in = bool(tx.get("is_cash_in"))
-            is_income = bool(tx.get("is_income"))
-            is_spending = bool(tx.get("is_spending", False))
+    def _resolve_is_asset(
+        self,
+        tx: Dict[str, Any],
+        acct_type: str,
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> bool:
+        """Determine whether a transaction's primary account is an asset (vs liability)."""
+        acct_id = str(tx.get("account_id") or "")
+        uaid = str(tx.get("user_account_id") or "")
+        t_name = tx.get("account_name") or ""
+        acct_info = acct_lookup.get(acct_id) or acct_lookup.get(uaid) or acct_lookup.get(t_name)
+        if acct_info:
+            return acct_info.get("is_asset", True)
+        type_lower = acct_type.lower()
+        return not (
+            "credit" in type_lower
+            or "loan" in type_lower
+            or "mortgage" in type_lower
+            or "liabilit" in type_lower
+        )
 
-            primary_account = self.mapper.resolve_account(firm, acct_name, resolved_id, acct_type)
+    @staticmethod
+    def _classify_investment_tx(
+        tx_type_clean: str,
+        inv_type_clean: str,
+        cat_clean: str,
+        ticker: str,
+        qty: float,
+    ) -> Tuple[bool, bool, bool]:
+        """Classify a transaction as (is_buy, is_sell, is_dividend)."""
+        is_buy = (
+            (tx_type_clean in ("buy", "reinvest") or inv_type_clean in ("buy", "reinvest"))
+            and bool(ticker)
+            and qty > 0
+        )
+        is_sell = (
+            (tx_type_clean in ("sell", "disposal") or inv_type_clean in ("sell", "disposal"))
+            and bool(ticker)
+            and qty > 0
+        )
+        is_dividend = (
+            "dividend" in tx_type_clean
+            or "dividend" in inv_type_clean
+            # A bare "dividend" category needs investment evidence (a ticker plus a
+            # transaction/investment type) before it is treated as an investment
+            # dividend; otherwise ordinary banking transactions labelled "dividend"
+            # would skip category resolution.
+            or ("dividend" in cat_clean and bool(ticker) and bool(tx_type_clean or inv_type_clean))
+        )
+        return is_buy, is_sell, is_dividend
 
-            # Investment transaction detection
-            raw_tx_type = tx.get("transaction_type") or ""
-            tx_type_clean = clean_api_text(raw_tx_type).strip().lower()
-            raw_inv_type = tx.get("investment_type") or ""
-            inv_type_clean = clean_api_text(raw_inv_type).strip().lower()
-            cat_clean = clean_api_text(cat_name or "").lower()
-            symbol = tx.get("symbol")
-            ticker = _clean_ticker(symbol)
-            raw_qty = tx.get("quantity")
-            raw_price = tx.get("price")
+    @staticmethod
+    def _tx_tag_str(tx_id: str) -> str:
+        """Build the ``^empower-tx-<id>`` link tag for a transaction, or '' when unavailable."""
+        link_id = tx_id[3:] if tx_id.startswith("tx-") else tx_id
+        link_id_clean = re.sub(r"[^A-Za-z0-9\-]", "", link_id)
+        return f" ^empower-tx-{link_id_clean}" if link_id_clean else ""
 
-            qty = abs(float(raw_qty)) if raw_qty is not None else 0.0
-            price = abs(float(raw_price)) if raw_price is not None else 0.0
+    @staticmethod
+    def _investment_payee_narration(tx: Dict[str, Any], firm: str) -> Tuple[str, str]:
+        """Resolve the payee and narration strings for an investment transaction."""
+        if firm and firm != _FIRM_INSTITUTION:
+            inv_payee = _escape_beancount_string(firm)
+        else:
+            inv_payee = _escape_beancount_string(tx.get("description") or _FIRM_BROKERAGE)
+        inv_narration = _escape_beancount_string(tx.get("description") or "")
+        return inv_payee, inv_narration
 
-            link_id = tx_id[3:] if tx_id.startswith("tx-") else tx_id
-            link_id_clean = re.sub(r"[^A-Za-z0-9\-]", "", link_id)
-            tag_str = f" ^empower-tx-{link_id_clean}" if link_id_clean else ""
+    def _build_tx_context(
+        self,
+        tx: Dict[str, Any],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Compute the shared per-transaction fields used by every emit handler."""
+        tx_id = str(tx.get("user_transaction_id") or "")
+        acct_id = str(tx.get("account_id") or "")
 
-            is_buy = (
-                (tx_type_clean in ("buy", "reinvest") or inv_type_clean in ("buy", "reinvest"))
-                and bool(ticker)
-                and qty > 0
-            )
-            is_sell = (
-                (tx_type_clean in ("sell", "disposal") or inv_type_clean in ("sell", "disposal"))
-                and bool(ticker)
-                and qty > 0
-            )
-            is_dividend = (
-                "dividend" in tx_type_clean
-                or "dividend" in inv_type_clean
-                # A bare "dividend" category needs investment evidence (a ticker
-                # plus a transaction/investment type) before it is treated as an
-                # investment dividend; otherwise ordinary banking transactions
-                # labelled "dividend" would skip category resolution.
-                or ("dividend" in cat_clean and bool(ticker) and bool(tx_type_clean or inv_type_clean))
-            )
+        # Use _resolve_account_from_tx so investment transactions consistently fall
+        # back to the brokerage identity (matching holdings reconciliation and
+        # assertions) so their postings reconcile in one account.
+        firm, acct_name, acct_type, resolved_id = _resolve_account_from_tx(tx, acct_lookup)
+        is_asset = self._resolve_is_asset(tx, acct_type, acct_lookup)
 
-            # Resolve payee and narration for investment transactions
-            if is_buy or is_sell or is_dividend:
-                if firm and firm != "Institution":
-                    inv_payee = _escape_beancount_string(firm)
-                else:
-                    inv_payee = _escape_beancount_string(tx.get("description") or "Brokerage")
-                inv_narration = _escape_beancount_string(tx.get("description") or "")
+        date = tx.get("transaction_date") or "2000-01-01"
+        cat_name = tx.get("category") or tx.get("category_name")
+        amount = abs(float(tx.get("amount") or 0.0))
+        primary_account = self.mapper.resolve_account(firm, acct_name, resolved_id, acct_type)
 
-                if is_buy:
-                    reported_amount = amount
-                    if price == 0 and amount > 0 and qty > 0:
-                        price = amount / qty
-                    # Calculate lot cost from qty × price; preserve full reported amount
-                    # as the cash outflow. If reported amount exceeds lot cost, the
-                    # difference is recorded as an Expenses:Fees posting.
-                    calculated_cost = round(qty * price, 2) if price > 0 and qty > 0 else 0.0
-                    fee = round(reported_amount - calculated_cost, 2) if calculated_cost > 0 else 0.0
-                    # Reinvested dividends are funded by dividend income, not by
-                    # brokerage cash; routing them through the cash-outflow leg
-                    # would wrongly drain USD and omit the dividend income.
-                    is_reinvest = tx_type_clean == "reinvest" or inv_type_clean == "reinvest"
-                    funding_account = (
-                        (self.mapper.categories.get("Dividends") or "Income:Dividends")
-                        if is_reinvest
-                        else primary_account
-                    )
-                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
-                    if tx_id:
-                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
-                    if acct_id:
-                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
-                    lines.append(
-                        f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
-                        f"{{{_format_price(price)} USD}}\n"
-                    )
-                    lines.append(f"  {funding_account:<36} {-reported_amount:>8.2f} USD\n")
-                    if fee > 0:
-                        fees_acct = self.mapper.categories.get("Fees") or "Expenses:Fees"
-                        lines.append(f"  {fees_acct:<36} {fee:>8.2f} USD\n")
-                    lines.append("\n")
-                    continue
+        tx_type_clean = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+        inv_type_clean = clean_api_text(tx.get("investment_type") or "").strip().lower()
+        cat_clean = clean_api_text(cat_name or "").lower()
+        ticker = _clean_ticker(tx.get("symbol"))
+        raw_qty = tx.get("quantity")
+        raw_price = tx.get("price")
+        qty = abs(float(raw_qty)) if raw_qty is not None else 0.0
+        price = abs(float(raw_price)) if raw_price is not None else 0.0
 
-                if is_sell:
-                    if price == 0 and amount > 0 and qty > 0:
-                        price = amount / qty
-                    if amount == 0 and price > 0 and qty > 0:
-                        amount = round(qty * price, 2)
-                    cap_gains_acct = self.mapper.categories.get("Capital Gains") or "Income:CapitalGains"
-                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
-                    if tx_id:
-                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
-                    if acct_id:
-                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
-                    lines.append(
-                        f"  {primary_account:<36} -{_format_quantity(qty)} {ticker} {{}} "
-                        f"@ {_format_price(price)} USD\n"
-                    )
-                    lines.append(f"  {primary_account:<36} {amount:>8.2f} USD\n")
-                    lines.append(f"  {cap_gains_acct}\n\n")
-                    continue
+        tag_str = self._tx_tag_str(tx_id)
 
-                if is_dividend:
-                    dividend_acct = self.mapper.categories.get("Dividends") or "Income:Dividends"
-                    lines.append(f'{date} * "{inv_payee}" "{inv_narration}"{tag_str}\n')
-                    if tx_id:
-                        lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
-                    if acct_id:
-                        lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
-                    lines.append(f"  {primary_account:<36} {amount:>8.2f} USD\n")
-                    lines.append(f"  {dividend_acct:<36} {-amount:>8.2f} USD\n\n")
-                    continue
+        is_buy, is_sell, is_dividend = self._classify_investment_tx(
+            tx_type_clean, inv_type_clean, cat_clean, ticker, qty
+        )
 
-            # Standard banking / spending / income transaction
-            payee = _escape_beancount_string(tx.get("description") or "Unknown Payee")
-            narration = _escape_beancount_string(cat_name or tx.get("original_description") or "")
+        # Payee/narration for investment transactions (unused by standard handling).
+        inv_payee, inv_narration = self._investment_payee_narration(tx, firm)
 
-            category_account = self.mapper.resolve_category_or_payee(
-                category=cat_name,
-                description=tx.get("description"),
-                is_spending=is_spending,
-                is_income=is_income,
-                category_id=tx.get("category_id"),
-                transaction_type=tx.get("transaction_type"),
-                memo=tx.get("original_description"),
-            )
+        return {
+            "tx": tx,
+            "tx_id": tx_id,
+            "acct_id": acct_id,
+            "firm": firm,
+            "primary_account": primary_account,
+            "is_asset": is_asset,
+            "date": date,
+            "cat_name": cat_name,
+            "amount": amount,
+            "is_credit": bool(tx.get("is_credit")),
+            "is_cash_in": bool(tx.get("is_cash_in")),
+            "is_income": bool(tx.get("is_income")),
+            "is_spending": bool(tx.get("is_spending", False)),
+            "tx_type_clean": tx_type_clean,
+            "inv_type_clean": inv_type_clean,
+            "ticker": ticker,
+            "qty": qty,
+            "price": price,
+            "tag_str": tag_str,
+            "is_buy": is_buy,
+            "is_sell": is_sell,
+            "is_dividend": is_dividend,
+            "inv_payee": inv_payee,
+            "inv_narration": inv_narration,
+        }
 
-            # Determine double-entry posting signs
-            is_liability = primary_account.startswith("Liabilities") or (not is_asset)
+    @staticmethod
+    def _emit_tx_header(
+        lines: List[str],
+        date: str,
+        payee: str,
+        narration: str,
+        tag_str: str,
+        tx_id: str,
+        acct_id: str,
+    ) -> None:
+        """Append the transaction header line plus optional id metadata lines."""
+        lines.append(f'{date} * "{payee}" "{narration}"{tag_str}\n')
+        if tx_id:
+            lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
+        if acct_id:
+            lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
 
-            if is_liability:
-                if is_credit or is_cash_in:
-                    acct_amount = amount
-                    bal_amount = -amount
-                else:
-                    acct_amount = -amount
-                    bal_amount = amount
-            elif is_credit or is_cash_in or is_income:
+    def _emit_investment_buy(self, ctx: Dict[str, Any], lines: List[str]) -> None:
+        primary_account = ctx["primary_account"]
+        qty = ctx["qty"]
+        price = ctx["price"]
+        amount = ctx["amount"]
+        ticker = ctx["ticker"]
+
+        reported_amount = amount
+        if price == 0 and amount > 0 and qty > 0:
+            price = amount / qty
+        # Calculate lot cost from qty × price; preserve full reported amount as the
+        # cash outflow. If reported amount exceeds lot cost, the difference is
+        # recorded as an Expenses:Fees posting.
+        calculated_cost = round(qty * price, 2) if price > 0 and qty > 0 else 0.0
+        fee = round(reported_amount - calculated_cost, 2) if calculated_cost > 0 else 0.0
+        # Reinvested dividends are funded by dividend income, not by brokerage cash;
+        # routing them through the cash-outflow leg would wrongly drain USD and omit
+        # the dividend income.
+        is_reinvest = ctx["tx_type_clean"] == "reinvest" or ctx["inv_type_clean"] == "reinvest"
+        funding_account = (
+            (self.mapper.categories.get("Dividends") or ACCT_INCOME_DIVIDENDS)
+            if is_reinvest
+            else primary_account
+        )
+        self._emit_tx_header(
+            lines, ctx["date"], ctx["inv_payee"], ctx["inv_narration"],
+            ctx["tag_str"], ctx["tx_id"], ctx["acct_id"],
+        )
+        lines.append(
+            f"  {primary_account:<36} {_format_quantity(qty):>10} {ticker} "
+            f"{{{_format_price(price)} USD}}\n"
+        )
+        lines.append(f"  {funding_account:<36} {-reported_amount:>8.2f} USD\n")
+        if fee > 0:
+            fees_acct = self.mapper.categories.get("Fees") or ACCT_EXPENSES_FEES
+            lines.append(f"  {fees_acct:<36} {fee:>8.2f} USD\n")
+        lines.append("\n")
+
+    def _emit_investment_sell(self, ctx: Dict[str, Any], lines: List[str]) -> None:
+        primary_account = ctx["primary_account"]
+        qty = ctx["qty"]
+        price = ctx["price"]
+        amount = ctx["amount"]
+        ticker = ctx["ticker"]
+
+        if price == 0 and amount > 0 and qty > 0:
+            price = amount / qty
+        if amount == 0 and price > 0 and qty > 0:
+            amount = round(qty * price, 2)
+        cap_gains_acct = self.mapper.categories.get("Capital Gains") or ACCT_INCOME_CAPITAL_GAINS
+        self._emit_tx_header(
+            lines, ctx["date"], ctx["inv_payee"], ctx["inv_narration"],
+            ctx["tag_str"], ctx["tx_id"], ctx["acct_id"],
+        )
+        lines.append(
+            f"  {primary_account:<36} -{_format_quantity(qty)} {ticker} {{}} "
+            f"@ {_format_price(price)} USD\n"
+        )
+        lines.append(f"  {primary_account:<36} {amount:>8.2f} USD\n")
+        lines.append(f"  {cap_gains_acct}\n\n")
+
+    def _emit_investment_dividend(self, ctx: Dict[str, Any], lines: List[str]) -> None:
+        dividend_acct = self.mapper.categories.get("Dividends") or ACCT_INCOME_DIVIDENDS
+        self._emit_tx_header(
+            lines, ctx["date"], ctx["inv_payee"], ctx["inv_narration"],
+            ctx["tag_str"], ctx["tx_id"], ctx["acct_id"],
+        )
+        lines.append(f"  {ctx['primary_account']:<36} {ctx['amount']:>8.2f} USD\n")
+        lines.append(f"  {dividend_acct:<36} {-ctx['amount']:>8.2f} USD\n\n")
+
+    def _emit_standard_tx(self, ctx: Dict[str, Any], lines: List[str]) -> None:
+        tx = ctx["tx"]
+        cat_name = ctx["cat_name"]
+        amount = ctx["amount"]
+        primary_account = ctx["primary_account"]
+
+        payee = _escape_beancount_string(tx.get("description") or "Unknown Payee")
+        narration = _escape_beancount_string(cat_name or tx.get("original_description") or "")
+
+        category_account = self.mapper.resolve_category_or_payee(
+            category=cat_name,
+            description=tx.get("description"),
+            is_spending=ctx["is_spending"],
+            is_income=ctx["is_income"],
+            category_id=tx.get("category_id"),
+            transaction_type=tx.get("transaction_type"),
+            memo=tx.get("original_description"),
+        )
+
+        # Determine double-entry posting signs
+        is_credit = ctx["is_credit"]
+        is_cash_in = ctx["is_cash_in"]
+        is_income = ctx["is_income"]
+        is_liability = primary_account.startswith("Liabilities") or (not ctx["is_asset"])
+
+        if is_liability:
+            if is_credit or is_cash_in:
                 acct_amount = amount
                 bal_amount = -amount
             else:
                 acct_amount = -amount
                 bal_amount = amount
+        elif is_credit or is_cash_in or is_income:
+            acct_amount = amount
+            bal_amount = -amount
+        else:
+            acct_amount = -amount
+            bal_amount = amount
 
-            lines.append(f'{date} * "{payee}" "{narration}"{tag_str}\n')
-            if tx_id:
-                lines.append(f'  empower_id: "{_escape_beancount_string(tx_id)}"\n')
-            if acct_id:
-                lines.append(f'  empower_account_id: "{_escape_beancount_string(acct_id)}"\n')
-            lines.append(f"  {primary_account:<36} {acct_amount:>8.2f} USD\n")
-            lines.append(f"  {category_account:<36} {bal_amount:>8.2f} USD\n\n")
-
-        return "".join(lines)
+        self._emit_tx_header(
+            lines, ctx["date"], payee, narration,
+            ctx["tag_str"], ctx["tx_id"], ctx["acct_id"],
+        )
+        lines.append(f"  {primary_account:<36} {acct_amount:>8.2f} USD\n")
+        lines.append(f"  {category_account:<36} {bal_amount:>8.2f} USD\n\n")
 
     def export_modular_ledger(
         self,
@@ -1329,55 +1624,74 @@ class BeancountGenerator:
         Safely avoids overwriting existing ledgers when append=True by preserving existing
         transactions and accounts.
         """
-        dest = Path(destination_dir).expanduser().resolve()
-        if dest.is_symlink():
-            raise ValueError(f"Destination directory cannot be a symlink: {dest}")
+        dest = _prepare_ledger_path(destination_dir, is_dir=True)
         dest.mkdir(parents=True, exist_ok=True)
-        created_files: List[Path] = []
-
-        def _verify_file_symlink(p: Path) -> None:
-            if p.is_symlink():
-                raise ValueError(f"Refusing to write to symlinked ledger target: {p}")
-
         effective_opening_date = _determine_opening_date(transactions, balances, opening_date)
 
-        # 1. main.bean
+        created_files: List[Path] = [
+            self._write_modular_main(dest, append),
+            self._write_modular_section(
+                dest, "accounts.bean",
+                self.generate_accounts_bean(balances, holdings, transactions, include_pads=False),
+            ),
+            self._write_modular_section(
+                dest, "balances.bean",
+                self.generate_balances_bean(balances, holdings, transactions=transactions),
+            ),
+            self._write_modular_holdings(
+                dest, append, holdings, balances, transactions, effective_opening_date,
+            ),
+            self._write_modular_section(
+                dest, "prices.bean", self.generate_prices_bean(holdings),
+            ),
+            self._write_modular_transactions(dest, append, transactions, balances),
+        ]
+        return created_files
+
+    def _write_modular_section(self, dest: Path, filename: str, content: str) -> Path:
+        """Write a freshly generated modular component file (always overwritten)."""
+        path = dest / filename
+        _verify_not_symlink(path)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def _write_modular_main(self, dest: Path, append: bool) -> Path:
+        """Write or patch main.bean, ensuring the holdings include and FIFO booking option."""
         main_path = dest / "main.bean"
-        _verify_file_symlink(main_path)
+        _verify_not_symlink(main_path)
         if not main_path.exists() or not append:
             main_path.write_text(self.generate_main_bean(), encoding="utf-8")
-        else:
-            current_main = main_path.read_text(encoding="utf-8")
-            updated_main = current_main
-            # Ensure holdings.bean include is present if missing
-            if 'include "holdings.bean"' not in updated_main:
-                updated_main += '\ninclude "holdings.bean"\n'
-            # Ensure a FIFO booking method is declared so appended sale
-            # transactions resolve against the oldest lot even when the ledger
-            # was created by an earlier release that omitted the option.
-            updated_main = _ensure_fifo_booking_method(updated_main)
-            if updated_main != current_main:
-                main_path.write_text(updated_main, encoding="utf-8")
-        created_files.append(main_path)
+            return main_path
+        current_main = main_path.read_text(encoding="utf-8")
+        updated_main = current_main
+        # Ensure holdings.bean include is present if missing
+        if 'include "holdings.bean"' not in updated_main:
+            updated_main += '\ninclude "holdings.bean"\n'
+        # Ensure a FIFO booking method is declared so appended sale transactions
+        # resolve against the oldest lot even when the ledger was created by an
+        # earlier release that omitted the option.
+        updated_main = _ensure_fifo_booking_method(updated_main)
+        if updated_main != current_main:
+            main_path.write_text(updated_main, encoding="utf-8")
+        return main_path
 
-        # 2. accounts.bean
-        accounts_path = dest / "accounts.bean"
-        _verify_file_symlink(accounts_path)
-        accounts_content = self.generate_accounts_bean(balances, holdings, transactions, include_pads=False)
-        accounts_path.write_text(accounts_content, encoding="utf-8")
-        created_files.append(accounts_path)
-
-        # 3. balances.bean
-        balances_path = dest / "balances.bean"
-        _verify_file_symlink(balances_path)
-        balances_content = self.generate_balances_bean(balances, holdings, transactions=transactions)
-        balances_path.write_text(balances_content, encoding="utf-8")
-        created_files.append(balances_path)
-
-        # 4. holdings.bean
+    def _write_modular_holdings(
+        self,
+        dest: Path,
+        append: bool,
+        holdings: Optional[DashboardHoldings],
+        balances: Optional[DashboardBalances],
+        transactions: Optional[DashboardTransactions],
+        effective_opening_date: Optional[str],
+    ) -> Path:
+        """Write holdings.bean, appending only the new lot body when appending to an existing file."""
         holdings_path = dest / "holdings.bean"
-        _verify_file_symlink(holdings_path)
-        existing_h_text = holdings_path.read_text(encoding="utf-8") if (holdings_path.exists() and append) else None
+        _verify_not_symlink(holdings_path)
+        existing_h_text = (
+            holdings_path.read_text(encoding="utf-8")
+            if (holdings_path.exists() and append)
+            else None
+        )
         holdings_content = (
             self.generate_holdings_bean(
                 holdings,
@@ -1391,48 +1705,33 @@ class BeancountGenerator:
         )
         if holdings_path.exists() and append:
             if holdings_content:
-                body_start = holdings_content.find("\n\n")
-                to_append = holdings_content[body_start + 2:] if body_start != -1 else holdings_content
+                to_append = _strip_bean_header(holdings_content)
                 if to_append.strip():
                     with open(holdings_path, "a", encoding="utf-8") as f:
                         f.write(to_append)
         else:
             holdings_path.write_text(holdings_content, encoding="utf-8")
-        created_files.append(holdings_path)
+        return holdings_path
 
-        # 5. prices.bean
-        prices_path = dest / "prices.bean"
-        _verify_file_symlink(prices_path)
-        prices_content = self.generate_prices_bean(holdings)
-        prices_path.write_text(prices_content, encoding="utf-8")
-        created_files.append(prices_path)
-
-        # 6. transactions.bean
+    def _write_modular_transactions(
+        self,
+        dest: Path,
+        append: bool,
+        transactions: Optional[DashboardTransactions],
+        balances: Optional[DashboardBalances],
+    ) -> Path:
+        """Write transactions.bean, appending only non-duplicate transactions on append."""
         tx_path = dest / "transactions.bean"
-        _verify_file_symlink(tx_path)
+        _verify_not_symlink(tx_path)
         if transactions and transactions.transactions:
             if tx_path.exists() and append:
-                existing_tx_text = tx_path.read_text(encoding="utf-8")
-                # Identify already exported transaction IDs
-                existing_ids = set(re.findall(r'empower_id:\s*"([^"]+)"', existing_tx_text))
-                new_txs = [
-                    t for t in transactions.transactions
-                    if str(t.get("user_transaction_id") or "") not in existing_ids
-                ]
-                if new_txs:
-                    delta_container = DashboardTransactions(
-                        start_date=transactions.start_date,
-                        end_date=transactions.end_date,
-                        total_transactions=len(new_txs),
-                        money_in=transactions.money_in,
-                        money_out=transactions.money_out,
-                        net_cashflow=transactions.net_cashflow,
-                        transactions=new_txs,
-                    )
+                existing_ids = set(
+                    re.findall(r'empower_id:\s*"([^"]+)"', tx_path.read_text(encoding="utf-8"))
+                )
+                delta_container = _build_delta_transactions(transactions, existing_ids)
+                if delta_container:
                     delta_text = self.generate_transactions_bean(delta_container, balances=balances)
-                    # Strip the header from delta_text when appending
-                    body_start = delta_text.find("\n\n")
-                    to_append = delta_text[body_start + 2:] if body_start != -1 else delta_text
+                    to_append = _strip_bean_header(delta_text)
                     with open(tx_path, "a", encoding="utf-8") as f:
                         f.write(to_append)
             else:
@@ -1440,9 +1739,7 @@ class BeancountGenerator:
                 tx_path.write_text(tx_content, encoding="utf-8")
         elif not tx_path.exists():
             tx_path.write_text("", encoding="utf-8")
-        created_files.append(tx_path)
-
-        return created_files
+        return tx_path
 
     def export_single_file(
         self,
@@ -1458,77 +1755,84 @@ class BeancountGenerator:
         When append=True and the file exists, preserves prior accounting entries and appends
         new balance assertions and non-duplicate transactions.
         """
-        target = Path(filepath).expanduser().resolve()
-        if target.is_symlink():
-            raise ValueError(f"Refusing to write to symlinked target file: {target}")
+        target = _prepare_ledger_path(filepath, is_dir=False)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         effective_opening_date = _determine_opening_date(transactions, balances, opening_date)
 
         if target.exists() and append:
-            existing_content = target.read_text(encoding="utf-8")
-            existing_ids = set(re.findall(r'empower_id:\s*"([^"]+)"', existing_content))
+            self._append_single_file(
+                target, balances, holdings, transactions, effective_opening_date,
+            )
+        else:
+            self._write_new_single_file(
+                target, balances, holdings, transactions, effective_opening_date,
+            )
+        return target
 
-            # Ensure a FIFO booking method is declared so appended sale
-            # transactions resolve against the oldest lot even when the file
-            # was created by an earlier release that omitted the option.
-            patched_content = _ensure_fifo_booking_method(existing_content)
-            if patched_content != existing_content:
-                target.write_text(patched_content, encoding="utf-8")
+    def _append_single_file(
+        self,
+        target: Path,
+        balances: Optional[DashboardBalances],
+        holdings: Optional[DashboardHoldings],
+        transactions: Optional[DashboardTransactions],
+        effective_opening_date: Optional[str],
+    ) -> None:
+        """Append new assertions, lots, prices, and non-duplicate transactions to an existing ledger."""
+        existing_content = target.read_text(encoding="utf-8")
+        existing_ids = set(re.findall(r'empower_id:\s*"([^"]+)"', existing_content))
 
-            delta_chunks: List[str] = [
-                f"\n\n;; ------------------------------------------------------------------------------\n"
-                f";; Empower Personal Dashboard Append Export\n"
-                f";; ------------------------------------------------------------------------------\n\n"
-            ]
+        # Ensure a FIFO booking method is declared so appended sale transactions
+        # resolve against the oldest lot even when the file was created by an
+        # earlier release that omitted the option.
+        patched_content = _ensure_fifo_booking_method(existing_content)
+        if patched_content != existing_content:
+            target.write_text(patched_content, encoding="utf-8")
 
-            # Append balance assertions if available
-            if balances or holdings:
-                delta_chunks.append(self.generate_balances_bean(balances, holdings, transactions=transactions))
-                delta_chunks.append("\n")
+        delta_chunks: List[str] = [
+            "\n\n;; ------------------------------------------------------------------------------\n"
+            ";; Empower Personal Dashboard Append Export\n"
+            ";; ------------------------------------------------------------------------------\n\n"
+        ]
 
-            # Append commodity holdings lots if available
-            if holdings:
-                delta_chunks.append(
-                    self.generate_holdings_bean(
-                        holdings,
-                        balances=balances,
-                        transactions=transactions,
-                        existing_content=existing_content,
-                        opening_date=effective_opening_date,
-                    )
+        # Append balance assertions if available
+        if balances or holdings:
+            delta_chunks.append(self.generate_balances_bean(balances, holdings, transactions=transactions))
+            delta_chunks.append("\n")
+
+        # Append commodity holdings lots and price points if available
+        if holdings:
+            delta_chunks.append(
+                self.generate_holdings_bean(
+                    holdings,
+                    balances=balances,
+                    transactions=transactions,
+                    existing_content=existing_content,
+                    opening_date=effective_opening_date,
                 )
-                delta_chunks.append("\n")
+            )
+            delta_chunks.append("\n")
+            delta_chunks.append(self.generate_prices_bean(holdings))
+            delta_chunks.append("\n")
 
-            # Append price points
-            if holdings:
-                delta_chunks.append(self.generate_prices_bean(holdings))
-                delta_chunks.append("\n")
+        # Append non-duplicate transactions
+        if transactions and transactions.transactions:
+            delta_container = _build_delta_transactions(transactions, existing_ids)
+            if delta_container:
+                delta_chunks.append(self.generate_transactions_bean(delta_container, balances=balances))
 
-            # Append non-duplicate transactions
-            if transactions and transactions.transactions:
-                new_txs = [
-                    t for t in transactions.transactions
-                    if str(t.get("user_transaction_id") or "") not in existing_ids
-                ]
-                if new_txs:
-                    delta_container = DashboardTransactions(
-                        start_date=transactions.start_date,
-                        end_date=transactions.end_date,
-                        total_transactions=len(new_txs),
-                        money_in=transactions.money_in,
-                        money_out=transactions.money_out,
-                        net_cashflow=transactions.net_cashflow,
-                        transactions=new_txs,
-                    )
-                    delta_tx_text = self.generate_transactions_bean(delta_container, balances=balances)
-                    delta_chunks.append(delta_tx_text)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write("".join(delta_chunks))
 
-            with open(target, "a", encoding="utf-8") as f:
-                f.write("".join(delta_chunks))
-            return target
-
-        # Clean new single-file ledger
+    def _write_new_single_file(
+        self,
+        target: Path,
+        balances: Optional[DashboardBalances],
+        holdings: Optional[DashboardHoldings],
+        transactions: Optional[DashboardTransactions],
+        effective_opening_date: Optional[str],
+    ) -> None:
+        """Write a fresh, complete single-file ledger."""
         chunks = [
             ";; ==============================================================================\n"
             ";; Empower Personal Dashboard - Single Ledger Export\n"
@@ -1557,4 +1861,3 @@ class BeancountGenerator:
             chunks.append(self.generate_transactions_bean(transactions, balances=balances))
 
         target.write_text("".join(chunks), encoding="utf-8")
-        return target
