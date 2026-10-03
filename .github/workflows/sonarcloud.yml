@@ -47,8 +47,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    env:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,18 +55,23 @@ jobs:
           # The Sonar scan does not need remote Git auth; don't leave the
           # GITHUB_TOKEN persisted in .git/config for later steps (artipacked).
           persist-credentials: false
+      - name: Check Sonar token presence
+        id: check_token
+        env:
+          HAS_TOKEN: ${{ secrets.SONAR_TOKEN != '' }}
+        run: echo "has_token=${HAS_TOKEN}" >> "$GITHUB_OUTPUT"
       # Produce coverage.xml in-workflow. The `coverage` job lives in ci.yml (a
       # separate workflow), and GitHub has no cross-workflow `needs:`, so Sonar
       # would otherwise report 0% coverage on new code and fail the quality gate.
       # sonar.python.coverage.reportPaths=coverage.xml (sonar-project.properties)
       # consumes the file written here.
       - name: Set up Python
-        if: env.SONAR_TOKEN != ''
+        if: steps.check_token.outputs.has_token == 'true'
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Generate coverage report
-        if: env.SONAR_TOKEN != ''
+        if: steps.check_token.outputs.has_token == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -77,15 +80,20 @@ jobs:
           coverage xml
       - name: Set up JDK 21
         id: setup_java
+        if: steps.check_token.outputs.has_token == 'true'
         uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
           java-version: '21'
       - name: SonarCloud Scan
         id: sonar
-        if: env.SONAR_TOKEN != ''
+        if: steps.check_token.outputs.has_token == 'true'
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         continue-on-error: true
       - name: SonarCloud Scan (retry)
-        if: env.SONAR_TOKEN != '' && steps.sonar.outcome == 'failure'
+        if: steps.check_token.outputs.has_token == 'true' && steps.sonar.outcome == 'failure'
         uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
