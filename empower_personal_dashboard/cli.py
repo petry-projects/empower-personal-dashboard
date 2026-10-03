@@ -638,6 +638,19 @@ def _resolve_requested_datasets(args):
     return do_balances, do_holdings, do_transactions
 
 
+def _safe_output_path(path: Path) -> Path:
+    """Resolve a user-supplied output path and refuse symlinked targets."""
+    resolved = Path(os.path.expanduser(str(path))).resolve()
+    if Path(os.path.expanduser(str(path))).is_symlink():
+        raise ValueError(f"Refusing to write to symlinked path: {path}")
+    return resolved
+
+
+def _emit(text: str) -> None:
+    """Write rendered user-requested report output to stdout."""
+    sys.stdout.write(text + "\n")
+
+
 def _load_balances(args, client, in_balances_file, progress_file):
     if in_balances_file:
         in_p = Path(in_balances_file)
@@ -656,8 +669,9 @@ def _load_balances(args, client, in_balances_file, progress_file):
     b_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
 
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
+        out_path = _safe_output_path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(b_data, f, indent=2, ensure_ascii=False)
         if not args.quiet:
             print(f"[+] Balances snapshot saved to: {args.output}", file=progress_file)
@@ -689,8 +703,9 @@ def _load_holdings(args, client, in_holdings_file, progress_file):
     h_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
 
     if args.output_holdings:
-        args.output_holdings.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output_holdings, "w", encoding="utf-8") as f:
+        out_path = _safe_output_path(args.output_holdings)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(h_data, f, indent=2, ensure_ascii=False)
         if not args.quiet:
             print(f"[+] Holdings snapshot saved to: {args.output_holdings}", file=progress_file)
@@ -759,13 +774,14 @@ def _load_transactions_from_file(args, in_transactions_file, progress_file):
 
 def _write_transactions_output(args, transactions_res, t_data, progress_file) -> None:
     if args.output_transactions:
-        args.output_transactions.parent.mkdir(parents=True, exist_ok=True)
+        out_path = _safe_output_path(args.output_transactions)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         if str(args.output_transactions).endswith(".jsonl"):
-            with open(args.output_transactions, "w", encoding="utf-8") as f:
+            with open(out_path, "w", encoding="utf-8") as f:
                 for tx in transactions_res.transactions:
                     f.write(json.dumps(tx, ensure_ascii=False) + "\n")
         else:
-            with open(args.output_transactions, "w", encoding="utf-8") as f:
+            with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(t_data, f, indent=2, ensure_ascii=False)
         if not args.quiet:
             print(f"[+] Transactions saved to: {args.output_transactions}", file=progress_file)
@@ -876,7 +892,7 @@ def _render_json(balances_res, holdings_res, transactions_res) -> None:
 
 def _render_markdown(args, balances_res, holdings_res, transactions_res) -> None:
     if balances_res:
-        print(render_balances_markdown(balances_res))
+        _emit(render_balances_markdown(balances_res))
     if holdings_res:
         print(render_holdings_markdown(holdings_res, limit=args.limit or 25))
     if transactions_res:
@@ -908,7 +924,7 @@ def _render_beancount(args, balances_res, holdings_res, transactions_res) -> Non
 
 def _render_table(args, balances_res, holdings_res, transactions_res) -> None:
     if balances_res:
-        print(render_balances_table(balances_res))
+        _emit(render_balances_table(balances_res))
     if holdings_res:
         print(render_holdings_table(holdings_res, limit=args.limit or 25))
     if transactions_res:

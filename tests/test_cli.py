@@ -381,3 +381,16 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestSafeOutputPath(unittest.TestCase):
+    def test_resolves_regular_path_and_rejects_symlink(self):
+        from empower_personal_dashboard.cli import _safe_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "out.json"
+            self.assertEqual(_safe_output_path(real), real.resolve())
+            link = Path(tmp) / "link.json"
+            link.symlink_to(real)
+            with self.assertRaises(ValueError):
+                _safe_output_path(link)
