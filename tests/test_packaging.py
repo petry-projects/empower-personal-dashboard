@@ -15,6 +15,7 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT_PATH = ROOT / "pyproject.toml"
 PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
+EXPECTED_VERSION = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))["project"]["version"]
 
 
 class TestPackaging(unittest.TestCase):
@@ -43,6 +44,7 @@ class TestPackaging(unittest.TestCase):
         urls = project.get("urls", {})
         self.assertIn("https://github.com/petry-projects/empower-personal-dashboard", urls.get("Homepage", ""))
         self.assertIn("https://github.com/petry-projects/empower-personal-dashboard", urls.get("Repository", ""))
+        self.assertEqual(urls.get("Changelog"), "https://github.com/petry-projects/empower-personal-dashboard/blob/main/CHANGELOG.md")
 
         opt_deps = project.get("optional-dependencies", {})
         self.assertIn("build", opt_deps)
@@ -270,6 +272,18 @@ class TestPackaging(unittest.TestCase):
                 self.assertEqual(len(parts), 2, f"Action reference must be pinned with @: {line}")
                 ref_part = parts[1].split()[0]
                 self.assertEqual(len(ref_part), 40, f"Action must be pinned to 40-character SHA: {line}")
+
+    def test_changelog_structure(self):
+        changelog_path = ROOT / "CHANGELOG.md"
+        self.assertTrue(changelog_path.exists(), "CHANGELOG.md must exist")
+        content = changelog_path.read_text(encoding="utf-8")
+        self.assertIn("# Changelog", content)
+        self.assertIn("## [Unreleased]", content)
+        self.assertIn(f"## [{EXPECTED_VERSION}]", content)
+        self.assertIn("## [0.1.1]", content)
+        self.assertIn("## [0.1.0]", content)
+        self.assertIn("[Unreleased]:", content)
+        self.assertIn(f"[{EXPECTED_VERSION}]:", content)
 
 
 if __name__ == "__main__":

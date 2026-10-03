@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "empower-personal-dashboard"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python client and CLI for Empower Personal Dashboard (formerly Personal Capital) with 2FA, session persistence, holdings, and transactions."
 readme = "README.md"
 license = "MIT"
@@ -87,6 +87,7 @@ empower-mcp = "empower_personal_dashboard.mcp_server:main"
 [project.urls]
 Homepage = "https://github.com/petry-projects/empower-personal-dashboard"
 Documentation = "https://github.com/petry-projects/empower-personal-dashboard#readme"
+Changelog = "https://github.com/petry-projects/empower-personal-dashboard/blob/main/CHANGELOG.md"
 Issues = "https://github.com/petry-projects/empower-personal-dashboard/issues"
 Repository = "https://github.com/petry-projects/empower-personal-dashboard.git"
 

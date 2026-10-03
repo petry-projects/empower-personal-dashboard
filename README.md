@@ -43,6 +43,7 @@ This library provides full programmatic and CLI access to:
   - [Local Validation & Preview](#local-validation--preview)
 - [Architecture & Authentication Lifecycle](#architecture--authentication-lifecycle)
 - [PyPI Packaging & Automated Publishing](#pypi-packaging--automated-publishing)
+- [📋 Changelog & Release Notes](#-changelog--release-notes)
 - [Security & Privacy Model](#security--privacy-model)
 - [Development & Testing](#development--testing)
 - [Contributing & Agent Standards](#contributing--agent-standards)
@@ -368,8 +369,15 @@ python scripts/pypi_onboard.py
 
 ### 4. Automated Publishing Workflow
 
-- **Automatic:** Creating a GitHub Release automatically builds and publishes packages to PyPI via `.github/workflows/publish.yml`.
-- **Manual Trigger (with Dry Run):** You can also run the workflow manually via `workflow_dispatch` with `dry_run: true` (default) to test artifact generation without releasing.
+- **Automated on Merge to `main`:** When a PR bumping the package `version` in `pyproject.toml` is merged to `main`, `.github/workflows/publish.yml` checks that the version is not already published on PyPI and that git tag `v<version>` does not exist, then builds and verifies the distribution packages with `twine check --strict`, publishes to PyPI tokenlessly via Trusted Publishing OIDC, and automatically creates the git tag and GitHub Release with generated release notes.
+- **GitHub Release Trigger:** Publishing a release manually or via the GitHub UI also triggers `.github/workflows/publish.yml`.
+- **Manual Trigger (with Dry Run):** You can run the workflow manually via `workflow_dispatch` with `dry_run: true` (default) to test artifact generation without releasing.
+
+---
+
+## 📋 Changelog & Release Notes
+
+All notable changes across releases are documented in [CHANGELOG.md](https://github.com/petry-projects/empower-personal-dashboard/blob/main/CHANGELOG.md) following [Keep a Changelog](https://keepachangelog.com/) standards. Releases are also tagged and detailed on [GitHub Releases](https://github.com/petry-projects/empower-personal-dashboard/releases).
 
 ---
 
