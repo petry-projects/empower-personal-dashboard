@@ -100,7 +100,7 @@ class TestOpenApiContract(unittest.TestCase):
 
         info = self.spec.get("info", {})
         self.assertEqual(info.get("title"), "Empower Personal Dashboard API")
-        self.assertEqual(info.get("version"), "0.1.1")
+        self.assertEqual(info.get("version"), "0.1.2")
         self.assertEqual(info.get("license", {}).get("identifier"), "MIT")
 
         servers = self.spec.get("servers", [])

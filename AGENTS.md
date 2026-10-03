@@ -47,7 +47,8 @@ empower-personal-dashboard/
 ├── openapi.yaml              # Root symlink to docs/openapi.yaml
 ├── redocly.yaml              # Redocly CLI linter configuration
 ├── pyproject.toml            # PEP 621 build configuration with SPDX MIT license
-└── requirements.txt          # Minimal runtime dependencies (requests>=2.28.0)
+├── requirements.txt          # Minimal runtime dependencies (requests>=2.28.0)
+└── CHANGELOG.md              # Keep a Changelog release history
 ```
 
 ### Core Design Principles

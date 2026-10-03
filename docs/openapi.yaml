@@ -6,7 +6,7 @@ info:
     Models the upstream RPC-over-HTTP wire protocol and canonical financial domain models for linked bank, credit, loan, and investment accounts.
 
     All data models and examples adhere strictly to the project's Zero-PII mandate using synthetic test benchmarks.
-  version: 0.1.1
+  version: 0.1.2
   contact:
     name: Empower Personal Dashboard Contributors
     url: https://github.com/petry-projects/empower-personal-dashboard
