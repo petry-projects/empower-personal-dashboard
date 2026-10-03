@@ -648,7 +648,7 @@ def _safe_output_path(path: Path) -> Path:
 
 def _emit(text: str) -> None:
     """Write rendered user-requested report output to stdout."""
-    sys.stdout.write(text + "\n")
+    print(text)
 
 
 def _load_balances(args, client, in_balances_file, progress_file):
