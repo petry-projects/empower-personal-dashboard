@@ -1,0 +1,21 @@
+title = "gitleaks config"
+
+# Inherit gitleaks' built-in default rule set. Passing `--config` REPLACES the
+# default rules unless the config extends them, so without this block the scan
+# would run with zero rules and silently report no leaks (gitleaks/gitleaks#740).
+[extend]
+useDefault = true
+
+# Add repo-specific allowlists below. gitleaks >= 8.25.0 reads the global
+# allowlist from the plural `[[allowlists]]` array; the singular `[allowlist]`
+# table is no longer applied.
+# Common false-positive paths:
+#   BMAD knowledge/config files (docs/config, not application secrets). Scope the
+#   allowlist to documentation/config extensions only — a blanket '''_bmad/'''
+#   would suppress gitleaks for EVERY file under that tree (e.g. a committed
+#   '''_bmad/.env''' or '''*.pem'''), letting real secrets pass the scan.
+[[allowlists]]
+description = "Allowlisted paths"
+paths = [
+  '''_bmad/.*\.(md|markdown|ya?ml|json|jsonc|txt|csv)$''',
+]

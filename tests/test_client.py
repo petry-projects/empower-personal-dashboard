@@ -48,6 +48,25 @@ class TestClientSessionPersistence(unittest.TestCase):
         client = EmpowerDashboardClient(session_file=Path("/nonexistent/file.json"), mock_mode=False)
         self.assertFalse(client.load_session())
 
+    def test_session_file_from_env_expands_tilde(self):
+        # A `~`-prefixed EMPOWER_SESSION_FILE must resolve to the home directory,
+        # not a literal "~" folder under the CWD.
+        with patch.dict(
+            os.environ,
+            {"EMPOWER_SESSION_FILE": "~/.empower_personal_dashboard_session.json"},
+            clear=False,
+        ):
+            client = EmpowerDashboardClient(mock_mode=True)
+        expected = Path.home() / ".empower_personal_dashboard_session.json"
+        self.assertEqual(client.session_file, expected)
+        self.assertNotIn("~", str(client.session_file))
+
+    def test_explicit_session_file_expands_tilde(self):
+        client = EmpowerDashboardClient(
+            session_file="~/some_session.json", mock_mode=True
+        )
+        self.assertEqual(client.session_file, Path.home() / "some_session.json")
+
 
 class TestClientAuthentication(unittest.TestCase):
     def setUp(self):
@@ -292,6 +311,42 @@ class TestClientMockMode(unittest.TestCase):
         txs_all = client.fetch_transactions()
         txs_limited = client.fetch_transactions(limit=1)
         self.assertEqual(txs_limited.start_date, txs_all.start_date)
+
+
+class TestClientDebugEnvFlag(unittest.TestCase):
+    """EMPOWER_DEBUG must be parsed as a boolean, not raw truthiness of the string."""
+
+    def _client_with_debug_env(self, value):
+        env = {k: v for k, v in os.environ.items() if k != "EMPOWER_DEBUG"}
+        if value is not None:
+            env["EMPOWER_DEBUG"] = value
+        with patch.dict(os.environ, env, clear=True):
+            return EmpowerDashboardClient(mock_mode=True)
+
+    def test_falsy_values_disable_debug(self):
+        # "0" and other falsy spellings must NOT enable debug (the #security fix:
+        # any non-empty string was previously truthy, so EMPOWER_DEBUG=0 leaked logs).
+        for value in ("0", "false", "False", "no", "off", "none", "", "  0  "):
+            self.assertFalse(
+                self._client_with_debug_env(value).debug,
+                msg=f"EMPOWER_DEBUG={value!r} should disable debug",
+            )
+
+    def test_unset_disables_debug(self):
+        self.assertFalse(self._client_with_debug_env(None).debug)
+
+    def test_truthy_values_enable_debug(self):
+        for value in ("1", "true", "TRUE", "yes", "on"):
+            self.assertTrue(
+                self._client_with_debug_env(value).debug,
+                msg=f"EMPOWER_DEBUG={value!r} should enable debug",
+            )
+
+    def test_explicit_debug_arg_overrides_falsy_env(self):
+        env = {k: v for k, v in os.environ.items() if k != "EMPOWER_DEBUG"}
+        env["EMPOWER_DEBUG"] = "0"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertTrue(EmpowerDashboardClient(mock_mode=True, debug=True).debug)
 
 
 if __name__ == "__main__":

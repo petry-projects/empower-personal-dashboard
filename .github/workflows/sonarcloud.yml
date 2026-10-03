@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCE OF TRUTH: petry-projects/.github/standards/workflows/sonarcloud.yml
+# Standard:        petry-projects/.github/standards/ci-standards.md#3-sonarcloud-analysis
+#
+# ADOPTING THIS WORKFLOW:
+#   1. This ships from petry-projects/repo-template, then is tailored per repo —
+#      see REPO-SPECIFIC TAILORING below; the surrounding scan scaffolding stays
+#      verbatim with the standard.
+#   2. Set sonar.projectKey / sonar.organization in sonar-project.properties to
+#      match your repo (see BOOTSTRAP.md), and add the SONAR_TOKEN repo secret.
+#   3. The job name `SonarCloud` is the required status check — keep it.
+#   4. The scan is guarded on SONAR_TOKEN, so the job is a green no-op until the
+#      secret is set — a fresh repo is not blocked on day 0.
+#
+# REPO-SPECIFIC TAILORING (NOT from the verbatim source — do not treat as drift
+# on a template sync, and do not silently drop on a standards audit):
+#   • The "Set up Python" + "Generate coverage report" steps below are added for
+#     this repo: they install requirements.txt and the `.[mcp,test]` extras and
+#     run `coverage` to emit coverage.xml, because the `coverage` job lives in
+#     ci.yml (a separate workflow) and GitHub has no cross-workflow `needs:`.
+#     The standard's sonarcloud.yml does not carry these steps.
+#
+# CONVENTIONS (enforced by the standard, for the non-tailored scaffolding):
+#   • permissions: {} at top, least-privilege per job (contents + pull-requests: read)
+#   • triggers: push + pull_request to main; checkout with fetch-depth: 0
+#   • first scan is continue-on-error with a single retry (SonarCloud's analysis
+#     endpoint is occasionally flaky)
+#   • SHA-pin every third-party action (never a tag/branch)
+# ─────────────────────────────────────────────────────────────────────────────
+name: SonarCloud Analysis
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  sonarcloud:
+    name: SonarCloud
+    runs-on: ubuntu-latest
+    # Bound the job so a flaky analysis endpoint (the two scan attempts below) can
+    # never hang indefinitely — matches the repo convention (ci.yml uses 10).
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # The Sonar scan does not need remote Git auth; don't leave the
+          # GITHUB_TOKEN persisted in .git/config for later steps (artipacked).
+          persist-credentials: false
+      - name: Check Sonar token presence
+        id: check_token
+        env:
+          HAS_TOKEN: ${{ secrets.SONAR_TOKEN != '' }}
+        run: echo "has_token=${HAS_TOKEN}" >> "$GITHUB_OUTPUT"
+      # Produce coverage.xml in-workflow. The `coverage` job lives in ci.yml (a
+      # separate workflow), and GitHub has no cross-workflow `needs:`, so Sonar
+      # would otherwise report 0% coverage on new code and fail the quality gate.
+      # sonar.python.coverage.reportPaths=coverage.xml (sonar-project.properties)
+      # consumes the file written here.
+      - name: Set up Python
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Generate coverage report
+        if: steps.check_token.outputs.has_token == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ".[mcp,test]"
+          coverage run -m unittest discover tests
+          coverage xml
+      - name: Set up JDK 21
+        id: setup_java
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: SonarCloud Scan
+        id: sonar
+        if: steps.check_token.outputs.has_token == 'true'
+        uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+      - name: SonarCloud Scan (retry)
+        if: steps.check_token.outputs.has_token == 'true' && steps.sonar.outcome == 'failure'
+        uses: SonarSource/sonarqube-scan-action@713881670b6b3676cda39549040e2d88c70d582e # v8.2.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
