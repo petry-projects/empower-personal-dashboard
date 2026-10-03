@@ -479,6 +479,26 @@ class TestClientMockMode(unittest.TestCase):
             self.assertEqual(point["total_liabilities"], 0.0)
             self.assertEqual(point["total_assets"], point["balances"]["ACC-CHK-003"])
 
+    def test_mock_histories_collapse_one_day_range_to_single_point(self):
+        # A one-day request makes start == mid == end; the curve must not stamp
+        # three contradictory balances on the same date.
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-05-01", end_date="2024-05-01")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates, ["2024-05-01"])
+        self.assertEqual(histories.total_points, 1)
+
+    def test_mock_histories_collapse_two_day_range_to_distinct_dates(self):
+        # A two-day request can make start == mid; emitted dates must be distinct
+        # and chronological with one coherent point per date.
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-05-01", end_date="2024-05-02")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates, sorted(set(dates)))
+        self.assertEqual(len(dates), len(set(dates)))
+        self.assertEqual(dates[0], "2024-05-01")
+        self.assertEqual(dates[-1], "2024-05-02")
+
     def test_mock_transactions_start_date_reflects_oldest_mock(self):
         client = EmpowerDashboardClient(mock_mode=True)
         txs = client.fetch_transactions(start_date=None)

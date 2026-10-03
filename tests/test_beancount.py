@@ -1342,6 +1342,135 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         cash = float(cash_match.group(1))
         self.assertAlmostEqual(qty * price + cash, 0.0, places=2)
 
+    def test_investment_tx_uses_brokerage_fallback_without_balances(self):
+        # With no balances lookup, a security buy must resolve to the SAME
+        # Brokerage account that holdings reconciliation and the quantity
+        # assertion use — not Institution — or the assertion fails to reconcile.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=5600.0,
+            holdings=[
+                {
+                    "user_account_id": 9001,
+                    "ticker": "VTI",
+                    "quantity": 20.0,
+                    "price": 280.0,
+                    "cost_basis": 5600.0,
+                }
+            ],
+        )
+        txns = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=5600.0,
+            net_cashflow=-5600.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-1",
+                    "account_id": "9001",
+                    "user_account_id": 9001,
+                    "transaction_date": "2024-05-01",
+                    "description": "Buy VTI",
+                    "amount": 5600.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 280.0,
+                    "quantity": 20.0,
+                }
+            ],
+        )
+        tx_out = self.generator.generate_transactions_bean(txns)
+        acct_out = self.generator.generate_accounts_bean(transactions=txns, holdings=holdings)
+        bal_out = self.generator.generate_balances_bean(holdings=holdings, transactions=txns)
+
+        self.assertIn("Assets:Brokerage", tx_out)
+        self.assertNotIn("Assets:Institution", tx_out)
+        # The commodity assertion account must match the buy posting + open.
+        m = re.search(r"(Assets:Brokerage\S*)\s+20\.0+\s+VTI", bal_out)
+        self.assertIsNotNone(m)
+        self.assertIn(m.group(1), tx_out)
+        self.assertIn(m.group(1), acct_out)
+
+    def test_generate_holdings_bean_positional_compat(self):
+        # Legacy positional API: (holdings, balances, existing_content, opening_date).
+        # The third positional must still bind to existing_content, not transactions.
+        existing = (
+            '2020-01-01 * "x" "y"\n'
+            '  empower_holding: "Assets:AcmeBrokerage:TaxableBrokerage:VTI"\n'
+        )
+        output = self.generator.generate_holdings_bean(
+            self.holdings_snapshot, self.balances, existing, "2020-01-01"
+        )
+        # VTI is present in existing_content, so its snapshot lot is skipped.
+        self.assertNotIn('"VTI Position"', output)
+
+    def test_generate_holdings_bean_transactions_is_keyword_only(self):
+        # transactions is keyword-only, so a legacy caller cannot accidentally
+        # pass it positionally in the old existing_content/opening_date slots.
+        with self.assertRaises(TypeError):
+            self.generator.generate_holdings_bean(
+                self.holdings_snapshot,
+                self.balances,
+                None,
+                "2020-01-01",
+                self.transactions_history,
+            )
+
+    def test_modular_append_injects_fifo_into_legacy_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "ledger"
+            dest.mkdir()
+            legacy_main = (
+                'option "title" "Legacy"\n'
+                'option "operating_currency" "USD"\n\n'
+                'plugin "beancount.plugins.auto_accounts"\n'
+                'include "transactions.bean"\n'
+            )
+            (dest / "main.bean").write_text(legacy_main, encoding="utf-8")
+
+            self.generator.export_modular_ledger(
+                dest, transactions=self.transactions_history, append=True
+            )
+            updated = (dest / "main.bean").read_text(encoding="utf-8")
+            self.assertEqual(updated.count('option "booking_method" "FIFO"'), 1)
+            self.assertIn('include "holdings.bean"', updated)
+
+    def test_single_file_append_injects_fifo_into_legacy_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ledger.bean"
+            legacy = (
+                'option "title" "Legacy"\n'
+                'option "operating_currency" "USD"\n\n'
+                "2020-01-01 open Assets:Foo USD\n"
+            )
+            target.write_text(legacy, encoding="utf-8")
+
+            self.generator.export_single_file(
+                target, transactions=self.transactions_history, append=True
+            )
+            updated = target.read_text(encoding="utf-8")
+            self.assertEqual(updated.count('option "booking_method" "FIFO"'), 1)
+
+    def test_single_file_append_preserves_existing_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ledger.bean"
+            current = (
+                'option "operating_currency" "USD"\n'
+                'option "booking_method" "FIFO"\n\n'
+                "2020-01-01 open Assets:Foo USD\n"
+            )
+            target.write_text(current, encoding="utf-8")
+
+            self.generator.export_single_file(
+                target, transactions=self.transactions_history, append=True
+            )
+            updated = target.read_text(encoding="utf-8")
+            # No duplicate option is injected when one already exists.
+            self.assertEqual(updated.count('option "booking_method" "FIFO"'), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

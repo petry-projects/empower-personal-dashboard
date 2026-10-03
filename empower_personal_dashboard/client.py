@@ -1091,6 +1091,17 @@ class EmpowerDashboardClient:
             },
         ]
 
+        # Collapse points that resolve to the same calendar date so a short
+        # requested range yields distinct, internally consistent daily
+        # snapshots instead of several contradictory values on one date: a
+        # one-day request makes start == mid == end, and a two-day request can
+        # make start == mid. The last candidate for a date wins, keeping the
+        # freshest snapshot for that day.
+        collapsed: Dict[str, Dict[str, Any]] = {}
+        for point in mock_histories:
+            collapsed[point["date"]] = point
+        mock_histories = list(collapsed.values())
+
         # Honour an account filter so a scoped history request does not leak
         # every account's balance; recompute aggregates from the kept balances.
         requested_user_ids = self._normalize_account_filter(user_account_ids)
