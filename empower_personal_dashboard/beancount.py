@@ -999,9 +999,10 @@ class BeancountGenerator:
 
             qty = baseline_qty
             if cost_basis is not None and float(cost_basis) > 0 and snapshot_qty > 0:
+                scaled_cost_basis = float(cost_basis) * qty / snapshot_qty
                 lines.append(
                     f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
-                    f"{{{{{_format_cost(float(cost_basis))} USD}}}}\n"
+                    f"{{{{{_format_cost(scaled_cost_basis)} USD}}}}\n"
                 )
             else:
                 lines.append(
