@@ -365,12 +365,12 @@ def render_balances_markdown(balances: DashboardBalances) -> str:
         "| :--- | :--- | :--- | :--- |",
     ]
 
-    for acct in balances.accounts:
-        firm = acct.get("firm_name", "—")
-        acct_name = acct.get("account_name", "Account")
-        acct_type = acct.get("account_type", "OTHER")
-        bal = acct.get("balance", 0.0)
-        lines.append(f"| {firm} | {acct_name} | `{acct_type}` | {format_currency(bal)} |")
+    for entry in balances.accounts:
+        institution = entry.get("firm_name", "—")
+        display_name = entry.get("account_name", "Account")
+        category = entry.get("account_type", "OTHER")
+        amount = entry.get("balance", 0.0)
+        lines.append(f"| {institution} | {display_name} | `{category}` | {format_currency(amount)} |")
 
     return "\n".join(lines)
 
