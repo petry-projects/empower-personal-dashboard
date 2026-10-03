@@ -574,8 +574,9 @@ def _determine_opening_date(
     """Determine initial opening date for baseline holdings lots.
 
     If an explicit opening_date is provided, use it. Otherwise, look for the earliest
-    transaction date and use min("2020-01-01", earliest_date). If no transactions exist
-    but balances exist, fallback to "2020-01-01".
+    transaction date and use min("2020-01-01", earliest_date - 1 day) so baseline lots
+    strictly precede every trade. If no transactions exist but balances exist, fallback
+    to "2020-01-01".
     """
     if opening_date:
         return opening_date
@@ -587,8 +588,12 @@ def _determine_opening_date(
             if (t.get("transaction_date") or t.get("date"))
         ]
         if tx_dates:
-            earliest_tx = min(tx_dates)
-            return min("2020-01-01", str(earliest_tx))
+            earliest_tx = str(min(tx_dates))
+            try:
+                earliest_tx = (datetime.date.fromisoformat(earliest_tx[:10]) - datetime.timedelta(days=1)).isoformat()
+            except ValueError:
+                pass
+            return min("2020-01-01", earliest_tx)
         return "2020-01-01"
 
     if balances and balances.accounts:
