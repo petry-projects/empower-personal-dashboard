@@ -24,6 +24,7 @@ except ImportError:
     from jsonschema import RefResolver
     HAS_REFERENCING = False
 
+from empower_personal_dashboard import __version__ as PACKAGE_VERSION
 from empower_personal_dashboard.client import EmpowerDashboardClient
 from empower_personal_dashboard.models import (
     AccountBalance,
@@ -100,7 +101,12 @@ class TestOpenApiContract(unittest.TestCase):
 
         info = self.spec.get("info", {})
         self.assertEqual(info.get("title"), "Empower Personal Dashboard API")
-        self.assertEqual(info.get("version"), "0.1.2")
+        self.assertEqual(
+            info.get("version"),
+            PACKAGE_VERSION,
+            "OpenAPI spec version must track the package version "
+            f"({PACKAGE_VERSION}); update docs/openapi.yaml when bumping the release.",
+        )
         self.assertEqual(info.get("license", {}).get("identifier"), "MIT")
 
         servers = self.spec.get("servers", [])
