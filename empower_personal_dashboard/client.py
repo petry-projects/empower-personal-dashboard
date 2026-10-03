@@ -572,7 +572,7 @@ class EmpowerDashboardClient:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        user_account_ids: Optional[Any] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
         limit: Optional[int] = None,
     ) -> DashboardTransactions:
         """Fetch account transactions for a date range, optionally filtered by account."""
@@ -653,7 +653,7 @@ class EmpowerDashboardClient:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        user_account_ids: Optional[Any] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
     ) -> DashboardHistories:
         """Fetch historical daily balance and net worth curve directly from Empower."""
         if self.mock_mode:
@@ -1028,7 +1028,7 @@ class EmpowerDashboardClient:
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        user_account_ids: Optional[Any] = None,
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]] = None,
     ) -> DashboardHistories:
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         start = start_date or "2024-01-01"
@@ -1130,7 +1130,7 @@ class EmpowerDashboardClient:
         )
 
     @staticmethod
-    def _normalize_account_filter(user_account_ids: Optional[Any]) -> Set[str]:
+    def _normalize_account_filter(user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]]) -> Set[str]:
         """Normalize a userAccountIds filter (list, tuple, or CSV string) to a set of ids."""
         if user_account_ids is None:
             return set()
