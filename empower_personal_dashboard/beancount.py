@@ -982,9 +982,9 @@ class BeancountGenerator:
                         key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
                     )
                     if tx_price > 0:
-                        if meta["any_price"] <= 0:
+                        if meta.get("any_price", 0.0) <= 0:
                             meta["any_price"] = tx_price
-                        if is_tx_buy and meta["buy_price"] <= 0:
+                        if is_tx_buy and meta.get("buy_price", 0.0) <= 0:
                             meta["buy_price"] = tx_price
 
         # Aggregate positions by (b_account, ticker) to emit each snapshot position only once
@@ -1025,20 +1025,20 @@ class BeancountGenerator:
                         }
                     else:
                         agg = aggregated_holdings[key]
-                        agg["quantity"] += qty
+                        agg["quantity"] = agg.get("quantity", 0.0) + qty
                         if cost_basis is not None:
-                            curr_cb = agg["cost_basis"] or 0.0
+                            curr_cb = agg.get("cost_basis") or 0.0
                             agg["cost_basis"] = curr_cb + float(cost_basis)
                         if price > 0:
                             agg["price"] = price
 
-        for pos in sorted(aggregated_holdings.values(), key=lambda p: (p["b_account"], p["ticker"])):
-            b_account = pos["b_account"]
-            ticker = pos["ticker"]
-            firm = pos["firm"]
-            snapshot_qty = pos["quantity"]
-            price = pos["price"]
-            cost_basis = pos["cost_basis"]
+        for pos in sorted(aggregated_holdings.values(), key=lambda p: (p.get("b_account", ""), p.get("ticker", ""))):
+            b_account = pos.get("b_account", "")
+            ticker = pos.get("ticker", "")
+            firm = pos.get("firm", "Brokerage")
+            snapshot_qty = pos.get("quantity", 0.0)
+            price = pos.get("price", 0.0)
+            cost_basis = pos.get("cost_basis")
 
             key = (b_account, ticker)
             if transactions is not None and transactions.transactions:
