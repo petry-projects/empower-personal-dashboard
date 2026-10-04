@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
 ### Added
 - Reconstruct investment growth curve and multi-year trade timeline in Beancount export ([#38](https://github.com/petry-projects/empower-personal-dashboard/issues/38)):
   - Formatted investment trades (`Buy`, `Sell`, `Reinvest`, `Dividend Received`) into double-entry transactions with commodity lot pricing, cash settlement legs, and capital gains tracking.
@@ -67,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Authoritative OpenAPI 3.1 specification (`docs/openapi.yaml`) with Redocly CI linting and hermetic contract tests.
 - PyPI onboarding probe, build verification, and Trusted Publishing OIDC workflow.
 
-[Unreleased]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/petry-projects/empower-personal-dashboard/releases/tag/v0.1.0
