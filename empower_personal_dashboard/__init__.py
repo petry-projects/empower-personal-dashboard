@@ -33,7 +33,7 @@ from .beancount import (
 )
 from .sanitizers import clean_api_text
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 def create_mcp_server(*args, **kwargs):
     """Lazy loader for creating the FastMCP server instance."""
