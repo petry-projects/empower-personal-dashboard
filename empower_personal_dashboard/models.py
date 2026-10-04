@@ -51,7 +51,6 @@ class DashboardBalances:
     total_other_assets: float = 0.0
     total_other_liabilities: float = 0.0
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -83,7 +82,6 @@ class DashboardBalances:
             total_other_liabilities=float(data.get("total_other_liabilities", 0.0)),
             accounts=list(data.get("accounts", [])),
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
 
 
@@ -127,7 +125,6 @@ class DashboardHoldings:
     total_value: float
     holdings: List[Dict[str, Any]]
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -145,7 +142,6 @@ class DashboardHoldings:
             total_value=float(data.get("total_value", 0.0)),
             holdings=list(data.get("holdings", [])),
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
 
 
@@ -211,7 +207,6 @@ class DashboardTransactions:
     net_cashflow: float
     transactions: List[Dict[str, Any]]
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -237,7 +232,6 @@ class DashboardTransactions:
             net_cashflow=float(data.get("net_cashflow", 0.0)),
             transactions=txs,
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
 
 
@@ -266,7 +260,6 @@ class DashboardHistories:
     histories: List[Dict[str, Any]]
     total_points: int = 0
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -286,6 +279,5 @@ class DashboardHistories:
             histories=raw_hist,
             total_points=int(data.get("total_points", len(raw_hist))),
             mode=data.get("mode", "live"),
-            raw_response=data.get("raw_response"),
         )
 

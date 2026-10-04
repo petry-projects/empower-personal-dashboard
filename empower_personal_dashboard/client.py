@@ -566,7 +566,6 @@ class EmpowerDashboardClient:
             total_other_liabilities=total_other_liabilities,
             accounts=normalized_accounts,
             mode="live",
-            raw_response=result,
         )
 
     def fetch_holdings(self) -> DashboardHoldings:
@@ -618,7 +617,6 @@ class EmpowerDashboardClient:
             total_value=total_val,
             holdings=normalized_holdings,
             mode="live",
-            raw_response=result,
         )
 
     def fetch_transactions(
@@ -699,7 +697,6 @@ class EmpowerDashboardClient:
             net_cashflow=net_cashflow,
             transactions=normalized_txs,
             mode="live",
-            raw_response=result,
         )
 
     def fetch_histories(
@@ -758,7 +755,6 @@ class EmpowerDashboardClient:
             total_points=len(normalized_histories),
             histories=normalized_histories,
             mode="live",
-            raw_response=result,
         )
 
     # --------------------------------------------------------------------------
