@@ -636,7 +636,7 @@ class EmpowerDashboardClient:
         if end_date:
             payload["endDate"] = end_date
         if user_account_ids is not None:
-            payload["userAccountIds"] = user_account_ids
+            payload["userAccountIds"] = self._account_ids_to_payload_list(user_account_ids)
 
         try:
             result = self.fetch("/transaction/getUserTransactions", data=payload)
@@ -719,7 +719,7 @@ class EmpowerDashboardClient:
         if end_date:
             payload["endDate"] = end_date
         if user_account_ids is not None:
-            payload["userAccountIds"] = user_account_ids
+            payload["userAccountIds"] = self._account_ids_to_payload_list(user_account_ids)
 
         try:
             result = self.fetch("/account/getHistories", data=payload)
@@ -1168,4 +1168,27 @@ class EmpowerDashboardClient:
             normalized = {str(x).strip() for x in user_account_ids if str(x).strip()}
             return normalized if normalized else set()
         return {str(user_account_ids).strip()}
+
+    @staticmethod
+    def _account_ids_to_payload_list(
+        user_account_ids: Optional[Union[str, List[Union[str, int]], Tuple[Union[str, int], ...], Set[Union[str, int]]]],
+    ) -> Optional[List[str]]:
+        """Normalize a userAccountIds filter to the array the RPC contract requires.
+
+        The canonical GetHistoriesRequest / GetTransactionsRequest schemas declare
+        ``userAccountIds`` as an *array*. A caller may legitimately pass the scalar
+        string form (e.g. ``"1001"`` or the CSV ``"1001,1002"``); sending that
+        through verbatim would put a scalar — or an unsplit CSV — on the wire where
+        an array is expected. Expand every supported form to a list of string ids so
+        the live payload matches the contract and the mock's CSV handling.
+        """
+        if user_account_ids is None:
+            return None
+        if isinstance(user_account_ids, str):
+            return [part.strip() for part in user_account_ids.split(",") if part.strip()]
+        if isinstance(user_account_ids, (list, tuple)):
+            return [str(x).strip() for x in user_account_ids if str(x).strip()]
+        if isinstance(user_account_ids, set):
+            return sorted(str(x).strip() for x in user_account_ids if str(x).strip())
+        return [str(user_account_ids).strip()]
 

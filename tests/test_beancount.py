@@ -1638,8 +1638,11 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             ],
         )
         output = self.generator.generate_transactions_bean(corr_tx, balances=self.balances)
-        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   -45.00 USD", output)
-        self.assertIn("Income:Dividends                        45.00 USD", output)
+        # Assert the account and the sign-precise amount independently of the
+        # column padding emitted by _emit_investment_dividend, so a cosmetic
+        # alignment change does not break a test about amount and direction.
+        self.assertRegex(output, r"Assets:AcmeBrokerage:TaxableBrokerage\s+-45\.00 USD")
+        self.assertRegex(output, r"Income:Dividends\s+45\.00 USD")
 
     def test_buy_with_missing_amount_derives_cost_from_quantity_and_price(self):
         # A Buy that omits amount but supplies quantity and price must derive the
@@ -1779,6 +1782,154 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         assertion_lines: list = []
         self.generator._emit_commodity_unit_assertions(holdings, {}, assertion_lines)
         self.assertIn("balance Assets:AcmeBrokerage:TaxableBrokerage 0.000001 MCR", "".join(assertion_lines))
+
+    def test_transactions_only_investment_account_not_asserted_as_cash(self):
+        # empower --transactions --beancount fetches balances but not holdings.
+        # The investment account's reported balance is portfolio value; it must
+        # not be asserted as USD cash (double-counting the generated lots).
+        txns = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=4000.0,
+            net_cashflow=-4000.0,
+            transactions=[
+                {
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-05-01",
+                    "description": "Buy VTI",
+                    "amount": 4000.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 200.0,
+                    "quantity": 20.0,
+                }
+            ],
+        )
+        output = self.generator.generate_balances_bean(
+            balances=self.balances, holdings=None, transactions=txns
+        )
+        self.assertNotIn("balance Assets:AcmeBrokerage:TaxableBrokerage", output)
+
+    def test_reconstructed_opening_lot_prices_from_sale_amount_when_price_null(self):
+        # A fully-sold security whose sale omits price but reports amount+quantity
+        # must still produce a COSTED opening lot (price derived from amount/qty),
+        # so the {} reduction in the sell can book against it.
+        sale = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=250.0,
+            money_out=0.0,
+            net_cashflow=250.0,
+            transactions=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-05-01",
+                    "description": "Sell GE",
+                    "amount": 250.0,
+                    "transaction_type": "Sell",
+                    "symbol": "GE",
+                    "price": None,
+                    "quantity": 10.0,
+                }
+            ],
+        )
+        output = self.generator.generate_holdings_bean(None, transactions=sale)
+        self.assertIn('"GE Opening Position"', output)
+        # Derived price = 250 / 10 = 25.00 => costed lot, not a bare uncosted lot.
+        self.assertIn("10.000000 GE {25.000000 USD}", output)
+
+    def test_reconstructed_micro_lot_emitted_at_six_decimal_precision(self):
+        # A 0.000001-share sale of a transaction-only security must emit an equally
+        # sized opening lot (same six-decimal rounding as the snapshot path), or
+        # the sale has no inventory to reduce.
+        micro_sale = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=1.0,
+            money_out=0.0,
+            net_cashflow=1.0,
+            transactions=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-05-01",
+                    "description": "Sell MCR",
+                    "amount": 1.0,
+                    "transaction_type": "Sell",
+                    "symbol": "MCR",
+                    "price": 100.0,
+                    "quantity": 0.000001,
+                }
+            ],
+        )
+        output = self.generator.generate_holdings_bean(None, transactions=micro_sale)
+        self.assertIn("0.000001 MCR", output)
+
+    def test_snapshot_opening_lot_floored_at_running_deficit(self):
+        # A still-held snapshot position can dip below its naive opening quantity
+        # mid-window (sell-then-buy). The opening lot must be floored at the deepest
+        # intermediate deficit so the earlier sale books, mirroring the reconstructed
+        # path. Naive baseline = 5 - net(0) = 5, but the window sells 10 first.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=60.0,
+            holdings=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "ticker": "GE",
+                    "quantity": 5.0,
+                    "price": 12.0,
+                }
+            ],
+        )
+        churn = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=2,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-03-01",
+                    "description": "Sell GE",
+                    "amount": 100.0,
+                    "transaction_type": "Sell",
+                    "symbol": "GE",
+                    "price": 10.0,
+                    "quantity": 10.0,
+                },
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-08-01",
+                    "description": "Buy GE",
+                    "amount": 120.0,
+                    "transaction_type": "Buy",
+                    "symbol": "GE",
+                    "price": 12.0,
+                    "quantity": 10.0,
+                },
+            ],
+        )
+        output = self.generator.generate_holdings_bean(holdings, transactions=churn)
+        self.assertIn("10.000000 GE {", output)
 
     def test_inferred_opening_date_never_precedes_account_opens(self):
         from empower_personal_dashboard.beancount import _determine_opening_date

@@ -328,6 +328,44 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertEqual(kwargs["data"]["endDate"], "2024-01-31")
 
     @patch("requests.Session.post")
+    def test_fetch_histories_normalizes_scalar_account_filter_to_array(self, mock_post):
+        # GetHistoriesRequest.userAccountIds is an array in the contract. A scalar
+        # string (incl. CSV) filter must be expanded to a list on the wire.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2024-01-01", "endDate": "2024-01-31", "histories": []},
+        }
+        mock_post.return_value = mock_resp
+
+        self.client.fetch_histories(
+            start_date="2024-01-01", end_date="2024-01-31", user_account_ids="1001"
+        )
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001"])
+
+        self.client.fetch_histories(
+            start_date="2024-01-01", end_date="2024-01-31", user_account_ids="1001,1002"
+        )
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001", "1002"])
+
+    @patch("requests.Session.post")
+    def test_fetch_transactions_normalizes_scalar_account_filter_to_array(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2024-01-01", "endDate": "2024-01-31", "transactions": []},
+        }
+        mock_post.return_value = mock_resp
+
+        self.client.fetch_transactions(user_account_ids="1001,1002")
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001", "1002"])
+
+    @patch("requests.Session.post")
     def test_fetch_histories_derives_bounds_from_points_when_absent(self, mock_post):
         # When neither the request nor the response supplies startDate/endDate,
         # the range bounds are derived from the returned point dates so the

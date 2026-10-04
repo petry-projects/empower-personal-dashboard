@@ -956,6 +956,14 @@ class BeancountGenerator:
 
         acct_lookup = _build_account_lookup(balances)
         commodity_accounts = self._collect_commodity_accounts(holdings, acct_lookup)
+        # ``empower --transactions --beancount`` fetches balances but not holdings,
+        # so holdings-derived commodity accounts are empty. Investment transactions
+        # still create security lots in those accounts, whose reported balance is
+        # portfolio value, not USD cash. Fold in the transaction-derived commodity
+        # accounts so their value is asserted as units below rather than double-
+        # counted as a cash assertion here.
+        if transactions and transactions.transactions:
+            commodity_accounts |= self._collect_commodity_tx_accounts(transactions, acct_lookup)
 
         self._emit_cash_liability_assertions(
             balances, transactions, acct_lookup, commodity_accounts, lines
@@ -1178,6 +1186,16 @@ class BeancountGenerator:
         )
         tx_raw_price = tx.get("price")
         tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
+        # A valid trade may report quantity and amount but omit price. Derive the
+        # per-unit price from amount / quantity — mirroring _emit_investment_sell /
+        # _emit_investment_buy — so the reconstructed opening lot is costed and a
+        # later ``{}`` sale reduction can book against it instead of hitting a bare
+        # (uncosted) opening lot.
+        if tx_price <= 0:
+            tx_raw_amount = tx.get("amount")
+            tx_amount = abs(float(tx_raw_amount)) if tx_raw_amount is not None else 0.0
+            if tx_amount > 0 and tx_qty > 0:
+                tx_price = tx_amount / tx_qty
         return (tx_b_account, t_ticker), tx_qty, is_tx_buy, is_tx_sell, tx_firm, tx_price
 
     def _accumulate_net_buy(
@@ -1307,6 +1325,14 @@ class BeancountGenerator:
             key = (b_account, ticker)
             # Baseline Opening Qty = Current Snapshot Qty - Net Buys within window.
             baseline_qty = snapshot_qty - net_buys.get(key, 0.0) if has_tx else snapshot_qty
+            # A snapshot position that is still held can nonetheless dip below the
+            # opening quantity mid-window (e.g. a sell-then-buy whose net is zero):
+            # floor the opening lot at the deepest intermediate deficit, mirroring
+            # the reconstructed-lot path, so the earlier sale has inventory to book
+            # against instead of failing the ledger before the later purchase.
+            if has_tx:
+                max_deficit = net_buy_meta.get(key, {}).get("max_deficit", 0.0)
+                baseline_qty = max(baseline_qty, max_deficit)
             # Skip only positions whose baseline rounds to zero at the emitted
             # six-decimal precision — acquired entirely within the window — so a
             # legitimate micro-position that still earns a balance assertion
@@ -1394,7 +1420,11 @@ class BeancountGenerator:
             # Opening units needed = the larger of the net sold quantity and the
             # deepest intermediate shortfall over the chronological trade sequence.
             baseline_qty = max(-nb, meta.get("max_deficit", 0.0))
-            if baseline_qty <= 0.000001:
+            # Use the same six-decimal rounding test as the snapshot-lot path
+            # (_emit_snapshot_lots / _emit_commodity_unit_assertions): a reconstructed
+            # micro-lot (e.g. a 0.000001-share sale) must still be emitted so the
+            # equally sized sale has inventory to reduce and the ledger books.
+            if round(baseline_qty, 6) <= 0:
                 continue
             b_account, ticker = key
             holding_tag = f"{b_account}:{ticker}"
