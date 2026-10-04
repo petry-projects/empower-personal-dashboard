@@ -466,6 +466,8 @@ class TestBeancountGenerator(unittest.TestCase):
     def test_generate_main_bean_contains_fava_option(self):
         output = self.generator.generate_main_bean()
         self.assertIn('1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"', output)
+        self.assertIn('1970-01-01 custom "fava-option" "locale" "en_US"', output)
+        self.assertIn('option "render_commas" "TRUE"', output)
 
     def test_generate_holdings_bean_with_opening_date(self):
         output = self.generator.generate_holdings_bean(self.synthetic_holdings, opening_date="2020-01-01")
