@@ -260,7 +260,7 @@ class TestCLI(unittest.TestCase):
             net_worth=1000.0,
             total_cash=1000.0,
             total_investment=0.0,
-            total_credit_card=0.0,
+            total_card_liabilities=0.0,
             total_loan=0.0,
             total_mortgage=0.0,
             accounts=[],
@@ -340,8 +340,67 @@ class TestCLI(unittest.TestCase):
         _, kwargs = mock_txs.call_args
         self.assertEqual(kwargs.get("start_date"), "2024-01-01")
 
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_cli_beancount_format_with_transactions_ignores_limit(self, mock_txs):
+        from empower_personal_dashboard.models import DashboardTransactions
+
+        mock_txs.return_value = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2026-10-02",
+            total_transactions=0,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[],
+        )
+
+        argv = [
+            "empower",
+            "--transactions",
+            "--format",
+            "beancount",
+            "--limit",
+            "50",
+            "--quiet",
+            "--session-file",
+            "/nonexistent/session.json",
+            "--mock",
+        ]
+        with patch.object(sys, "argv", argv):
+            exit_code = cli_main()
+            self.assertEqual(exit_code, 0)
+
+        mock_txs.assert_called_once()
+        _, kwargs = mock_txs.call_args
+        # When --format beancount is used with --transactions, limit should be None
+        # to fetch complete history for accurate Beancount reconstruction
+        self.assertIsNone(kwargs.get("limit"))
+
+
+class TestSafeOutputPath(unittest.TestCase):
+    def test_resolves_regular_path_and_rejects_symlink(self):
+        from empower_personal_dashboard.cli import _safe_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "out.json"
+            self.assertEqual(_safe_output_path(real), real.resolve())
+            link = Path(tmp) / "link.json"
+            link.symlink_to(real)
+            with self.assertRaises(ValueError):
+                _safe_output_path(link)
+
+    def test_rejects_output_inside_symlinked_directory(self):
+        from empower_personal_dashboard.cli import _safe_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_dir = Path(tmp) / "real"
+            real_dir.mkdir()
+            link_dir = Path(tmp) / "link"
+            link_dir.symlink_to(real_dir)
+            output_inside_link = link_dir / "out.json"
+            with self.assertRaises(ValueError):
+                _safe_output_path(output_inside_link)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

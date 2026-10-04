@@ -242,8 +242,8 @@ def create_mcp_server(
                 "net_worth": balances.net_worth,
                 "total_cash": balances.total_cash,
                 "total_investment": balances.total_investment,
-                "total_credit": balances.total_credit_card,
-                "total_credit_card": balances.total_credit_card,
+                "total_credit": balances.total_card_liabilities,
+                "total_credit_card": balances.total_card_liabilities,
                 "total_mortgage": balances.total_mortgage,
                 "total_loan": balances.total_loan,
                 "total_other_assets": balances.total_other_assets,
@@ -258,7 +258,7 @@ def create_mcp_server(
                     f"- **Total Investments**: {format_currency(balances.total_investment)}\n"
                     f"- **Total Cash / Banking**: {format_currency(balances.total_cash)}\n"
                     f"- **Real Estate & Physical Assets**: {format_currency(balances.total_other_assets)}\n"
-                    f"- **Credit Card Liabilities**: -{format_currency(balances.total_credit_card)}\n"
+                    f"- **Credit Card Liabilities**: -{format_currency(balances.total_card_liabilities)}\n"
                     f"- **Mortgages & Loans**: -{format_currency(balances.total_mortgage + balances.total_loan)}\n"
                     f"- **Linked Accounts**: {len(balances.accounts)}"
                 )
@@ -272,7 +272,7 @@ def create_mcp_server(
                     f"| Total Investments | {format_currency(balances.total_investment)} |",
                     f"| Total Cash / Banking | {format_currency(balances.total_cash)} |",
                     f"| Real Estate & Physical Assets | {format_currency(balances.total_other_assets)} |",
-                    f"| Credit Card Liabilities | -{format_currency(balances.total_credit_card)} |",
+                    f"| Credit Card Liabilities | -{format_currency(balances.total_card_liabilities)} |",
                     f"| Mortgages & Loans | -{format_currency(balances.total_mortgage + balances.total_loan)} |",
                     f"| Linked Accounts | {len(balances.accounts)} |",
                 ]
@@ -363,8 +363,8 @@ def create_mcp_server(
                 totals_by_type = {
                     "cash": balances.total_cash,
                     "investment": balances.total_investment,
-                    "credit": balances.total_credit_card,
-                    "credit_card": balances.total_credit_card,
+                    "credit": balances.total_card_liabilities,
+                    "credit_card": balances.total_card_liabilities,
                     "mortgage": balances.total_mortgage,
                     "loan": balances.total_loan,
                     "other_assets": balances.total_other_assets,
@@ -376,7 +376,7 @@ def create_mcp_server(
                 net_worth=balances.net_worth,
                 total_cash=totals_by_type["cash"],
                 total_investment=totals_by_type["investment"],
-                total_credit_card=totals_by_type["credit_card"],
+                total_card_liabilities=totals_by_type["credit_card"],
                 total_loan=totals_by_type["loan"],
                 total_mortgage=totals_by_type["mortgage"],
                 total_other_assets=totals_by_type["other_assets"],

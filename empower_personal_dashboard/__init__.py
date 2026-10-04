@@ -18,7 +18,9 @@ from .exceptions import (
 )
 from .models import (
     AccountBalance,
+    DailyHistoryPoint,
     DashboardBalances,
+    DashboardHistories,
     DashboardHoldings,
     DashboardTransactions,
     InvestmentHolding,
@@ -42,7 +44,9 @@ def create_mcp_server(*args, **kwargs):
 __all__ = [
     "EmpowerDashboardClient",
     "AccountBalance",
+    "DailyHistoryPoint",
     "DashboardBalances",
+    "DashboardHistories",
     "InvestmentHolding",
     "DashboardHoldings",
     "Transaction",
@@ -60,4 +64,5 @@ __all__ = [
     "BeancountMapper",
     "slugify_account_name",
 ]
+
 
