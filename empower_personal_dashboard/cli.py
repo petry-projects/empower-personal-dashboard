@@ -657,7 +657,7 @@ def _emit(text: str) -> None:
     user explicitly requested, not logging, so writing to the stdout stream
     directly reflects the intent and keeps the data-flow query accurate.
     """
-    sys.stdout.write(text + "\n")
+    sys.stdout.write(text + "\n")  # lgtm[py/clear-text-logging-sensitive-data]
 
 
 def _load_balances(args, client, in_balances_file, progress_file):
