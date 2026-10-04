@@ -203,7 +203,7 @@ class TestBeancountGenerator(unittest.TestCase):
             net_worth=15000.0,
             total_cash=5000.0,
             total_investment=12000.0,
-            total_credit_card=2000.0,
+            total_card_liabilities=2000.0,
             total_loan=0.0,
             total_mortgage=0.0,
             accounts=[
@@ -863,7 +863,7 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             net_worth=21000.0,
             total_cash=0.0,
             total_investment=21000.0,
-            total_credit_card=0.0,
+            total_card_liabilities=0.0,
             total_loan=0.0,
             total_mortgage=0.0,
             accounts=[

@@ -260,7 +260,7 @@ class TestCLI(unittest.TestCase):
             net_worth=1000.0,
             total_cash=1000.0,
             total_investment=0.0,
-            total_credit_card=0.0,
+            total_card_liabilities=0.0,
             total_loan=0.0,
             total_mortgage=0.0,
             accounts=[],

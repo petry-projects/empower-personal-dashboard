@@ -33,7 +33,7 @@ class TestModels(unittest.TestCase):
             net_worth=500000.0,
             total_cash=50000.0,
             total_investment=460000.0,
-            total_credit_card=10000.0,
+            total_card_liabilities=10000.0,
             total_loan=0.0,
             total_mortgage=0.0,
             accounts=[{"account_name": "Checking", "balance": 50000.0}],

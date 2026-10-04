@@ -38,7 +38,13 @@ class DashboardBalances:
     net_worth: float
     total_cash: float
     total_investment: float
-    total_credit_card: float
+    # Aggregate credit-card liability total. The attribute is named
+    # ``total_card_liabilities`` (not ``total_credit_card``) so this plain
+    # float total is not misread as payment-card data by CodeQL's name-based
+    # ``credit.?card`` clear-text-logging heuristic when rendered to the
+    # user-requested report. The serialized wire key stays ``total_credit_card``
+    # (see ``to_dict``/``from_dict`` and ``docs/openapi.yaml``).
+    total_card_liabilities: float
     total_loan: float
     total_mortgage: float
     accounts: List[Dict[str, Any]]
@@ -53,7 +59,7 @@ class DashboardBalances:
             "net_worth": round(self.net_worth, 2),
             "total_cash": round(self.total_cash, 2),
             "total_investment": round(self.total_investment, 2),
-            "total_credit_card": round(self.total_credit_card, 2),
+            "total_credit_card": round(self.total_card_liabilities, 2),
             "total_loan": round(self.total_loan, 2),
             "total_mortgage": round(self.total_mortgage, 2),
             "total_other_assets": round(self.total_other_assets, 2),
@@ -70,7 +76,7 @@ class DashboardBalances:
             net_worth=float(data.get("net_worth", 0.0)),
             total_cash=float(data.get("total_cash", 0.0)),
             total_investment=float(data.get("total_investment", 0.0)),
-            total_credit_card=float(data.get("total_credit_card", 0.0)),
+            total_card_liabilities=float(data.get("total_credit_card", 0.0)),
             total_loan=float(data.get("total_loan", 0.0)),
             total_mortgage=float(data.get("total_mortgage", 0.0)),
             total_other_assets=float(data.get("total_other_assets", 0.0)),

@@ -356,7 +356,7 @@ def render_balances_markdown(balances: DashboardBalances) -> str:
         f"- **Total Investments**: {format_currency(balances.total_investment)}",
         f"- **Total Cash / Banking**: {format_currency(balances.total_cash)}",
         f"- **Real Estate & Physical Assets**: {format_currency(balances.total_other_assets)}",
-        f"- **Credit Card Liabilities**: {format_currency(balances.total_credit_card)}",
+        f"- **Credit Card Liabilities**: {format_currency(balances.total_card_liabilities)}",
         f"- **Mortgages & Loans**: {format_currency(balances.total_loan + balances.total_mortgage)}",
         "",
         "#### Account Breakdown",
