@@ -612,6 +612,29 @@ def _determine_opening_date(
     return None
 
 
+def _clamp_before_earliest_trade(opening: str, transactions: Optional[DashboardTransactions]) -> str:
+    """Ensure reconstructed opening lots are dated strictly before the earliest trade.
+
+    A caller-supplied ``opening_date`` later than an included investment trade would
+    place the baseline inventory after the reduction that needs it, so the ledger
+    could not book the sale. Clamp to the day before the earliest trade instead.
+    """
+    if not transactions or not transactions.transactions:
+        return opening
+    trade_dates = [
+        str(t.get("transaction_date") or t.get("date"))[:10]
+        for t in transactions.transactions
+        if t.get("symbol") and (t.get("transaction_date") or t.get("date"))
+    ]
+    if not trade_dates:
+        return opening
+    try:
+        cap = (datetime.date.fromisoformat(min(trade_dates)) - datetime.timedelta(days=1)).isoformat()
+    except ValueError:
+        return opening
+    return min(opening, cap)
+
+
 def _ensure_fifo_booking_method(content: str) -> str:
     """Inject a FIFO ``booking_method`` option into an existing ledger header lacking one.
 
@@ -1120,7 +1143,7 @@ class BeancountGenerator:
         """Determine the dated day used for reconstructed opening lots."""
         effective_opening = opening_date or _determine_opening_date(transactions, balances, None)
         if effective_opening:
-            return effective_opening
+            return _clamp_before_earliest_trade(effective_opening, transactions)
         # Date the holdings snapshot a day before the balance assertion date so
         # Beancount's beginning-of-day balance assertion on as_of passes cleanly.
         as_of = holdings.as_of_date if holdings else None
