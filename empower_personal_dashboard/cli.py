@@ -640,10 +640,13 @@ def _resolve_requested_datasets(args):
 
 def _safe_output_path(path: Path) -> Path:
     """Resolve a user-supplied output path and refuse symlinked targets."""
-    resolved = Path(os.path.expanduser(str(path))).resolve()
-    if Path(os.path.expanduser(str(path))).is_symlink():
+    expanded = Path(os.path.expanduser(str(path)))
+    if expanded.is_symlink():
         raise ValueError(f"Refusing to write to symlinked path: {path}")
-    return resolved
+    for parent in expanded.parents:
+        if parent.is_symlink():
+            raise ValueError(f"Refusing to write to path inside symlinked directory: {path}")
+    return expanded.resolve()
 
 
 def _emit(text: str) -> None:
@@ -683,7 +686,7 @@ def _load_balances(args, client, in_balances_file, progress_file):
             print(f"[+] Balances snapshot saved to: {args.output}", file=progress_file)
 
     if args.csv and args.output:
-        csv_path = args.output.with_suffix(".csv")
+        csv_path = _safe_output_path(args.output.with_suffix(".csv"))
         export_balances_csv(balances_res, csv_path)
         if not args.quiet:
             print(f"[+] Balances CSV saved to: {csv_path}", file=progress_file)
@@ -717,7 +720,7 @@ def _load_holdings(args, client, in_holdings_file, progress_file):
             print(f"[+] Holdings snapshot saved to: {args.output_holdings}", file=progress_file)
 
     if args.csv and args.output_holdings:
-        csv_path = args.output_holdings.with_suffix(".csv")
+        csv_path = _safe_output_path(args.output_holdings.with_suffix(".csv"))
         export_holdings_csv(holdings_res, csv_path)
         if not args.quiet:
             print(f"[+] Holdings CSV saved to: {csv_path}", file=progress_file)
@@ -793,7 +796,7 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
             print(f"[+] Transactions saved to: {args.output_transactions}", file=progress_file)
 
     if args.csv and args.output_transactions:
-        csv_path = args.output_transactions.with_suffix(".csv")
+        csv_path = _safe_output_path(args.output_transactions.with_suffix(".csv"))
         export_transactions_csv(transactions_res, csv_path)
         if not args.quiet:
             print(f"[+] Transactions CSV saved to: {csv_path}", file=progress_file)

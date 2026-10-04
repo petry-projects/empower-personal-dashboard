@@ -389,6 +389,18 @@ class TestSafeOutputPath(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _safe_output_path(link)
 
+    def test_rejects_output_inside_symlinked_directory(self):
+        from empower_personal_dashboard.cli import _safe_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_dir = Path(tmp) / "real"
+            real_dir.mkdir()
+            link_dir = Path(tmp) / "link"
+            link_dir.symlink_to(real_dir)
+            output_inside_link = link_dir / "out.json"
+            with self.assertRaises(ValueError):
+                _safe_output_path(output_inside_link)
+
 
 if __name__ == "__main__":
     unittest.main()
