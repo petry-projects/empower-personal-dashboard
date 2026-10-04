@@ -647,6 +647,13 @@ def _prepare_ledger_path(filepath: Union[str, Path], *, is_dir: bool) -> Path:
     if expanded.is_symlink():
         kind = "directory" if is_dir else "target file"
         raise ValueError(f"Refusing to write to symlinked {kind}: {expanded}")
+    # A symlink anywhere in the parent chain can redirect the write outside the
+    # intended location just as a symlinked leaf can; ``resolve()`` would follow
+    # it silently. Reject every symlinked parent before resolving, matching the
+    # CLI's ``_safe_output_path`` guard.
+    for parent in expanded.parents:
+        if parent.is_symlink():
+            raise ValueError(f"Refusing to write to path inside symlinked directory: {expanded}")
     return expanded.resolve()
 
 

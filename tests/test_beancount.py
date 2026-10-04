@@ -443,6 +443,26 @@ class TestBeancountGenerator(unittest.TestCase):
             # The real target behind the link is left untouched.
             self.assertEqual(real.read_text(encoding="utf-8"), ";; original\n")
 
+    def test_export_single_file_refuses_symlinked_parent_dir(self):
+        # A symlinked *parent directory* can redirect the write outside the
+        # intended location just as a symlinked leaf can; export_single_file
+        # must refuse it before resolving/following the link.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            real_dir = Path(tmp_dir) / "real_dir"
+            real_dir.mkdir()
+            link_dir = Path(tmp_dir) / "link_dir"
+            link_dir.symlink_to(real_dir)
+            target_inside_link = link_dir / "ledger.bean"
+            with self.assertRaises(ValueError):
+                self.generator.export_single_file(
+                    filepath=target_inside_link,
+                    balances=self.synthetic_balances,
+                    holdings=self.synthetic_holdings,
+                    transactions=self.synthetic_transactions,
+                )
+            # Nothing was written through the symlinked directory.
+            self.assertEqual(list(real_dir.iterdir()), [])
+
     def test_generate_main_bean_contains_fava_option(self):
         output = self.generator.generate_main_bean()
         self.assertIn('1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"', output)
