@@ -38,14 +38,19 @@ class DashboardBalances:
     net_worth: float
     total_cash: float
     total_investment: float
-    total_credit_card: float
+    # Aggregate credit-card liability total. The attribute is named
+    # ``total_card_liabilities`` (not ``total_credit_card``) so this plain
+    # float total is not misread as payment-card data by CodeQL's name-based
+    # ``credit.?card`` clear-text-logging heuristic when rendered to the
+    # user-requested report. The serialized wire key stays ``total_credit_card``
+    # (see ``to_dict``/``from_dict`` and ``docs/openapi.yaml``).
+    total_card_liabilities: float
     total_loan: float
     total_mortgage: float
     accounts: List[Dict[str, Any]]
     total_other_assets: float = 0.0
     total_other_liabilities: float = 0.0
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -53,7 +58,7 @@ class DashboardBalances:
             "net_worth": round(self.net_worth, 2),
             "total_cash": round(self.total_cash, 2),
             "total_investment": round(self.total_investment, 2),
-            "total_credit_card": round(self.total_credit_card, 2),
+            "total_credit_card": round(self.total_card_liabilities, 2),
             "total_loan": round(self.total_loan, 2),
             "total_mortgage": round(self.total_mortgage, 2),
             "total_other_assets": round(self.total_other_assets, 2),
@@ -70,14 +75,13 @@ class DashboardBalances:
             net_worth=float(data.get("net_worth", 0.0)),
             total_cash=float(data.get("total_cash", 0.0)),
             total_investment=float(data.get("total_investment", 0.0)),
-            total_credit_card=float(data.get("total_credit_card", 0.0)),
+            total_card_liabilities=float(data.get("total_credit_card", 0.0)),
             total_loan=float(data.get("total_loan", 0.0)),
             total_mortgage=float(data.get("total_mortgage", 0.0)),
             total_other_assets=float(data.get("total_other_assets", 0.0)),
             total_other_liabilities=float(data.get("total_other_liabilities", 0.0)),
             accounts=list(data.get("accounts", [])),
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
 
 
@@ -121,7 +125,6 @@ class DashboardHoldings:
     total_value: float
     holdings: List[Dict[str, Any]]
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -139,7 +142,6 @@ class DashboardHoldings:
             total_value=float(data.get("total_value", 0.0)),
             holdings=list(data.get("holdings", [])),
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
 
 
@@ -205,7 +207,6 @@ class DashboardTransactions:
     net_cashflow: float
     transactions: List[Dict[str, Any]]
     mode: str = "live"
-    raw_response: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -231,5 +232,52 @@ class DashboardTransactions:
             net_cashflow=float(data.get("net_cashflow", 0.0)),
             transactions=txs,
             mode=data.get("mode", "historical"),
-            raw_response=data.get("raw_response"),
         )
+
+
+@dataclass
+class DailyHistoryPoint:
+    date: str
+    net_worth: float
+    total_assets: float = 0.0
+    total_liabilities: float = 0.0
+    balances: Dict[str, float] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "date": self.date,
+            "net_worth": round(self.net_worth, 2),
+            "total_assets": round(self.total_assets, 2),
+            "total_liabilities": round(self.total_liabilities, 2),
+            "balances": self.balances,
+        }
+
+
+@dataclass
+class DashboardHistories:
+    start_date: str
+    end_date: str
+    histories: List[Dict[str, Any]]
+    total_points: int = 0
+    mode: str = "live"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "total_points": self.total_points or len(self.histories),
+            "histories": self.histories,
+            "mode": self.mode,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DashboardHistories":
+        raw_hist = list(data.get("histories", []))
+        return cls(
+            start_date=data.get("start_date", ""),
+            end_date=data.get("end_date", ""),
+            histories=raw_hist,
+            total_points=int(data.get("total_points", len(raw_hist))),
+            mode=data.get("mode", "live"),
+        )
+

@@ -277,6 +277,249 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertNotIn("startDate", payload)
         self.assertEqual(txs.start_date, "2018-05-12")
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_live_mocked(self, mock_post):
+        from empower_personal_dashboard.models import DashboardHistories
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-31",
+                "histories": [
+                    {
+                        "date": "2024-01-01",
+                        "totalAssets": 150000.0,
+                        "totalLiabilities": 5000.0,
+                        "netWorth": 145000.0,
+                        "balances": {
+                            "ACC-INV-001": 120000.0,
+                            "ACC-CHK-002": 30000.0,
+                            "ACC-CRD-003": -5000.0,
+                        },
+                    },
+                    {
+                        "date": "2024-01-15",
+                        "totalAssets": 155000.0,
+                        "totalLiabilities": 4500.0,
+                        "netWorth": 150500.0,
+                        "balances": {
+                            "ACC-INV-001": 124000.0,
+                            "ACC-CHK-002": 31000.0,
+                            "ACC-CRD-003": -4500.0,
+                        },
+                    },
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-31")
+        self.assertIsInstance(histories, DashboardHistories)
+        self.assertEqual(histories.total_points, 2)
+        self.assertEqual(histories.histories[0]["date"], "2024-01-01")
+        self.assertEqual(histories.histories[0]["net_worth"], 145000.0)
+        self.assertEqual(histories.histories[1]["balances"]["ACC-INV-001"], 124000.0)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["startDate"], "2024-01-01")
+        self.assertEqual(kwargs["data"]["endDate"], "2024-01-31")
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_normalizes_scalar_account_filter_to_array(self, mock_post):
+        # GetHistoriesRequest.userAccountIds is an array in the contract. A scalar
+        # string (incl. CSV) filter must be expanded to a list on the wire.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2024-01-01", "endDate": "2024-01-31", "histories": []},
+        }
+        mock_post.return_value = mock_resp
+
+        self.client.fetch_histories(
+            start_date="2024-01-01", end_date="2024-01-31", user_account_ids="1001"
+        )
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001"])
+
+        self.client.fetch_histories(
+            start_date="2024-01-01", end_date="2024-01-31", user_account_ids="1001,1002"
+        )
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001", "1002"])
+
+    @patch("requests.Session.post")
+    def test_fetch_transactions_normalizes_scalar_account_filter_to_array(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2024-01-01", "endDate": "2024-01-31", "transactions": []},
+        }
+        mock_post.return_value = mock_resp
+
+        self.client.fetch_transactions(user_account_ids="1001,1002")
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["data"]["userAccountIds"], ["1001", "1002"])
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_derives_bounds_from_points_when_absent(self, mock_post):
+        # When neither the request nor the response supplies startDate/endDate,
+        # the range bounds are derived from the returned point dates so the
+        # canonical schema's required date bounds are never empty strings.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                # startDate / endDate omitted by upstream.
+                "histories": [
+                    {"date": "2024-03-02", "netWorth": 100.0},
+                    {"date": "2024-01-01", "netWorth": 90.0},
+                    {"date": "2024-06-15", "netWorth": 110.0},
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories()
+        self.assertEqual(histories.start_date, "2024-01-01")
+        self.assertEqual(histories.end_date, "2024-06-15")
+        exported = histories.to_dict()
+        self.assertEqual(exported["start_date"], "2024-01-01")
+        self.assertEqual(exported["end_date"], "2024-06-15")
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_total_assets_fallback_excludes_liabilities(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        # totalAssets and netWorth omitted -> both are derived.
+                        "date": "2024-01-01",
+                        "balances": {"ACC-1": 100000.0, "ACC-CARD": -5000.0},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        # Only positive balances count as assets; the negative card is a liability.
+        self.assertEqual(point["total_assets"], 100000.0)
+        self.assertEqual(point["total_liabilities"], 5000.0)
+        # net_worth = total_assets - total_liabilities
+        self.assertEqual(point["net_worth"], 95000.0)
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_normalizes_liabilities_to_absolute(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        "date": "2024-01-01",
+                        "totalAssets": 150000.0,
+                        "totalLiabilities": -5000.0,
+                        "balances": {},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        self.assertEqual(point["total_liabilities"], 5000.0)
+        self.assertEqual(point["net_worth"], 145000.0)
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_sanitizes_mojibake_date_and_keys(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {
+                        "date": "2024-01-01�",
+                        "totalAssets": 100000.0,
+                        "balances": {"ACC�-1": 100000.0},
+                    }
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+        point = histories.histories[0]
+        # The U+FFFD replacement character is stripped from the date and keys.
+        self.assertEqual(point["date"], "2024-01-01")
+        self.assertNotIn("�", point["date"])
+        self.assertIn("ACC-1", point["balances"])
+        self.assertTrue(all("�" not in k for k in point["balances"]))
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_wraps_malformed_numeric_in_empower_error(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                "startDate": "2024-01-01",
+                "endDate": "2024-01-01",
+                "histories": [
+                    {"date": "2024-01-01", "totalAssets": "N/A"}
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        # A non-numeric totalAssets must surface as the domain EmpowerError
+        # rather than a raw ValueError leaking from normalization.
+        with self.assertRaises(EmpowerError):
+            self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_empty_response_has_valid_bounds(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"spHeader": {"success": True}, "spData": {"histories": []}}
+        mock_post.return_value = mock_resp
+        histories = self.client.fetch_histories()
+        self.assertEqual(histories.total_points, 0)
+        self.assertEqual(histories.start_date, histories.end_date)
+        self.assertRegex(histories.start_date, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(histories.end_date, r"^\d{4}-\d{2}-\d{2}$")
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_empty_response_clamps_missing_end_to_start(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2026-06-01", "histories": []},
+        }
+        mock_post.return_value = mock_resp
+        histories = self.client.fetch_histories(start_date="2026-01-01")
+        self.assertEqual(histories.start_date, "2026-06-01")
+        self.assertGreaterEqual(histories.end_date, histories.start_date)
+
 
 class TestClientMockMode(unittest.TestCase):
     def test_offline_sandbox_mock_generators(self):
@@ -295,6 +538,56 @@ class TestClientMockMode(unittest.TestCase):
         txs = client.fetch_transactions()
         self.assertEqual(txs.mode, "sandbox_mock")
         self.assertGreater(txs.total_transactions, 0)
+
+        histories = client.fetch_histories()
+        self.assertEqual(histories.mode, "sandbox_mock")
+        self.assertGreater(histories.total_points, 0)
+        self.assertGreater(histories.histories[0]["net_worth"], 0)
+
+    def test_mock_histories_points_stay_within_requested_range(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-03-01", end_date="2024-09-30")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates[0], "2024-03-01")
+        self.assertEqual(dates[-1], "2024-09-30")
+        for d in dates:
+            self.assertGreaterEqual(d, "2024-03-01")
+            self.assertLessEqual(d, "2024-09-30")
+        # Dates are non-decreasing (chronological).
+        self.assertEqual(dates, sorted(dates))
+
+    def test_mock_histories_respect_account_filter(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            user_account_ids=["ACC-CHK-003"],
+        )
+        for point in histories.histories:
+            self.assertEqual(list(point["balances"].keys()), ["ACC-CHK-003"])
+            # Aggregates are recomputed from the single kept (positive) balance.
+            self.assertEqual(point["total_liabilities"], 0.0)
+            self.assertEqual(point["total_assets"], point["balances"]["ACC-CHK-003"])
+
+    def test_mock_histories_collapse_one_day_range_to_single_point(self):
+        # A one-day request makes start == mid == end; the curve must not stamp
+        # three contradictory balances on the same date.
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-05-01", end_date="2024-05-01")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates, ["2024-05-01"])
+        self.assertEqual(histories.total_points, 1)
+
+    def test_mock_histories_collapse_two_day_range_to_distinct_dates(self):
+        # A two-day request can make start == mid; emitted dates must be distinct
+        # and chronological with one coherent point per date.
+        client = EmpowerDashboardClient(mock_mode=True)
+        histories = client.fetch_histories(start_date="2024-05-01", end_date="2024-05-02")
+        dates = [p["date"] for p in histories.histories]
+        self.assertEqual(dates, sorted(set(dates)))
+        self.assertEqual(len(dates), len(set(dates)))
+        self.assertEqual(dates[0], "2024-05-01")
+        self.assertEqual(dates[-1], "2024-05-02")
 
     def test_mock_transactions_start_date_reflects_oldest_mock(self):
         client = EmpowerDashboardClient(mock_mode=True)

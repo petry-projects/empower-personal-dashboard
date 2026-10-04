@@ -313,6 +313,32 @@ paths:
         '401':
           $ref: '#/components/responses/UnauthorizedError'
 
+  /account/getHistories:
+    post:
+      summary: Fetch daily portfolio history and account balance trajectory
+      description: Retrieves daily snapshots of total assets, total liabilities, net worth, and individual account balances across a specified date range.
+      operationId: getHistories
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/GetHistoriesRequest'
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetHistoriesRequest'
+      responses:
+        '200':
+          description: Daily balance histories and net worth trajectory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetHistoriesEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
 components:
   securitySchemes:
     CookieAuth:
@@ -660,6 +686,38 @@ components:
           type: string
           default: "-1"
           example: "-1"
+        apiClient:
+          type: string
+          default: WEB
+          example: WEB
+        csrf:
+          type: string
+          description: Active session CSRF token.
+          example: csrf-token-synthetic-abc123
+
+    GetHistoriesRequest:
+      type: object
+      required:
+        - csrf
+      properties:
+        startDate:
+          type: string
+          format: date
+          description: Start date of historical query range (YYYY-MM-DD).
+          example: "2026-09-01"
+        endDate:
+          type: string
+          format: date
+          description: End date of historical query range (YYYY-MM-DD).
+          example: "2026-09-30"
+        userAccountIds:
+          type: array
+          items:
+            type:
+              - integer
+              - string
+          description: Optional list of user account IDs to filter.
+          example: [1001, 1002]
         apiClient:
           type: string
           default: WEB
@@ -1041,6 +1099,76 @@ components:
           $ref: '#/components/schemas/SpHeader'
         spData:
           $ref: '#/components/schemas/TransactionsData'
+
+    DailyHistoryEntryWire:
+      type: object
+      description: Raw daily history snapshot from getHistories RPC.
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-09-01"
+        totalAssets:
+          type: number
+          format: double
+          example: 549500.00
+        totalLiabilities:
+          type: number
+          format: double
+          example: 2450.00
+        netWorth:
+          type: number
+          format: double
+          example: 547050.00
+        balances:
+          type: object
+          description: >-
+            Map of account ID to balance on that date. Upstream responses may
+            also carry sibling keys suffixed `Annotation` whose values are
+            textual notes rather than numbers; these are modelled separately via
+            patternProperties and ignored by the client normalizer.
+          patternProperties:
+            "Annotation$":
+              type: string
+              description: Optional textual annotation for an account balance entry.
+          additionalProperties:
+            type: number
+            format: double
+          example:
+            "1001": 350000.00
+            "1002": 120000.00
+            "1003": 75000.00
+            "1004": 4500.00
+            "1005": 2450.00
+
+    HistoriesData:
+      type: object
+      description: Data payload returned by getHistories RPC.
+      properties:
+        startDate:
+          type: string
+          format: date
+          description: Start date of the historical query range returned (YYYY-MM-DD).
+          example: "2026-09-01"
+        endDate:
+          type: string
+          format: date
+          description: End date of the historical query range returned (YYYY-MM-DD).
+          example: "2026-09-30"
+        histories:
+          type: array
+          items:
+            $ref: '#/components/schemas/DailyHistoryEntryWire'
+
+    GetHistoriesEnvelope:
+      type: object
+      required:
+        - spHeader
+      properties:
+        spHeader:
+          $ref: '#/components/schemas/SpHeader'
+        spData:
+          $ref: '#/components/schemas/HistoriesData'
 
     # --------------------------------------------------------------------------
     # Tier 2: Canonical Domain Schemas (CLI, Python Models, & FastMCP)
@@ -1443,6 +1571,77 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Transaction'
+        mode:
+          type: string
+          enum:
+            - live
+            - sandbox_mock
+          example: live
+
+    DailyHistoryPoint:
+      type: object
+      description: Canonical daily snapshot point for portfolio net worth and account balances.
+      required:
+        - date
+        - total_assets
+        - total_liabilities
+        - net_worth
+        - balances
+      properties:
+        date:
+          type: string
+          format: date
+          example: "2026-09-01"
+        total_assets:
+          type: number
+          format: double
+          example: 549500.00
+        total_liabilities:
+          type: number
+          format: double
+          example: 2450.00
+        net_worth:
+          type: number
+          format: double
+          example: 547050.00
+        balances:
+          type: object
+          additionalProperties:
+            type: number
+            format: double
+          description: Map of account ID string to balance amount.
+          example:
+            "1001": 350000.00
+            "1002": 120000.00
+            "1003": 75000.00
+            "1004": 4500.00
+            "1005": 2450.00
+
+    DashboardHistories:
+      type: object
+      description: Canonical historical trajectory collection over a query date range.
+      required:
+        - start_date
+        - end_date
+        - total_points
+        - histories
+        - mode
+      properties:
+        start_date:
+          type: string
+          format: date
+          example: "2026-09-01"
+        end_date:
+          type: string
+          format: date
+          example: "2026-09-30"
+        total_points:
+          type: integer
+          example: 3
+        histories:
+          type: array
+          items:
+            $ref: '#/components/schemas/DailyHistoryPoint'
         mode:
           type: string
           enum:
