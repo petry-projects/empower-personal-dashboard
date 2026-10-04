@@ -1986,6 +1986,17 @@ class TestOpeningDateClamp(unittest.TestCase):
         self.assertEqual(_clamp_before_earliest_trade("2025-01-01", txs), "2024-05-09")
         self.assertEqual(_clamp_before_earliest_trade("2020-01-01", txs), "2020-01-01")
         self.assertEqual(_clamp_before_earliest_trade("2025-01-01", None), "2025-01-01")
+        old_txs = DashboardTransactions(
+            start_date="2000-01-01",
+            end_date="2000-01-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[{"transaction_date": "2000-01-01", "symbol": "VTI", "amount": 1.0}],
+        )
+        # Account-open floor is preserved
+        self.assertEqual(_clamp_before_earliest_trade("2000-01-01", old_txs), "2000-01-01")
 
 
 if __name__ == "__main__":

@@ -632,7 +632,9 @@ def _clamp_before_earliest_trade(opening: str, transactions: Optional[DashboardT
         cap = (datetime.date.fromisoformat(min(trade_dates)) - datetime.timedelta(days=1)).isoformat()
     except ValueError:
         return opening
-    return min(opening, cap)
+    # Never move the lot before the supported account-open date: postings preceding
+    # their account's open directive are rejected by Beancount.
+    return max(_ACCOUNT_OPEN_DATE, min(opening, cap))
 
 
 def _ensure_fifo_booking_method(content: str) -> str:

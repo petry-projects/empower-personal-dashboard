@@ -519,6 +519,17 @@ class TestClientMockMode(unittest.TestCase):
         self.assertGreater(histories.total_points, 0)
         self.assertGreater(histories.histories[0]["net_worth"], 0)
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_empty_response_has_valid_bounds(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"spHeader": {"success": True}, "spData": {"histories": []}}
+        mock_post.return_value = mock_resp
+        histories = self.client.fetch_histories()
+        self.assertEqual(histories.total_points, 0)
+        self.assertRegex(histories.start_date, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(histories.end_date, r"^\d{4}-\d{2}-\d{2}$")
+
     def test_mock_histories_points_stay_within_requested_range(self):
         client = EmpowerDashboardClient(mock_mode=True)
         histories = client.fetch_histories(start_date="2024-03-01", end_date="2024-09-30")

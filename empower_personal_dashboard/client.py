@@ -755,6 +755,11 @@ class EmpowerDashboardClient:
                 resp_start = min(point_dates)
             if not resp_end and point_dates:
                 resp_end = max(point_dates)
+            # Empty responses without bounds still need schema-valid dates (format: date).
+            if not resp_end:
+                resp_end = start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if not resp_start:
+                resp_start = resp_end
         except SessionExpiredError:
             raise
         except Exception as e:
