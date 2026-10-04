@@ -32,6 +32,11 @@ BEANCOUNT_ACCOUNT_REGEX = re.compile(
     r"(:[A-Z0-9][A-Za-z0-9\-]*)*$"
 )
 
+# Date every generated account ``open`` directive uses. Inferred opening-lot
+# dates are clamped to never precede it, so a reconstructed lot cannot post
+# against an account Beancount considers not yet open.
+_ACCOUNT_OPEN_DATE = "2000-01-01"
+
 # Canonical Beancount account names reused across multiple generators.
 ACCT_OPENING_BALANCES = "Equity:Opening-Balances"
 ACCT_INCOME_DIVIDENDS = "Income:Dividends"
@@ -262,19 +267,22 @@ def _build_account_lookup(balances: Optional[DashboardBalances]) -> Dict[str, Di
 def _is_investment_tx(transaction: Dict[str, Any]) -> bool:
     """True when a transaction represents a security trade or investment dividend.
 
-    Requires a ticker symbol plus a buy/sell/reinvest/disposal or dividend
-    transaction/investment type, matching the investment detection used when
-    emitting postings.
+    A security trade (buy/sell/reinvest/disposal) requires a ticker, matching
+    the investment detection used when emitting postings. A dividend is
+    recognised from its transaction/investment type independently of whether the
+    upstream payload supplied a ticker — the canonical transaction schema permits
+    a null symbol — so a symbol-less dividend still posts to the brokerage
+    account rather than splitting into ``Assets:Institution``.
     """
-    if not _clean_ticker(transaction.get("symbol")):
-        return False
     tt = clean_api_text(transaction.get("transaction_type") or "").strip().lower()
     it = clean_api_text(transaction.get("investment_type") or "").strip().lower()
+    if "dividend" in tt or "dividend" in it:
+        return True
+    if not _clean_ticker(transaction.get("symbol")):
+        return False
     return (
         tt in ("buy", "sell", "reinvest", "disposal")
         or it in ("buy", "sell", "reinvest", "disposal")
-        or "dividend" in tt
-        or "dividend" in it
     )
 
 
@@ -575,8 +583,10 @@ def _determine_opening_date(
 
     If an explicit opening_date is provided, use it. Otherwise, look for the earliest
     transaction date and use min("2020-01-01", earliest_date - 1 day) so baseline lots
-    strictly precede every trade. If no transactions exist but balances exist, fallback
-    to "2020-01-01".
+    strictly precede every trade, clamped to never fall before "2000-01-01" — the date
+    every generated account ``open`` directive uses, so an inferred pre-2000 lot would
+    otherwise post against an account Beancount considers not yet open. If no
+    transactions exist but balances exist, fallback to "2020-01-01".
     """
     if opening_date:
         return opening_date
@@ -593,7 +603,7 @@ def _determine_opening_date(
                 earliest_tx = (datetime.date.fromisoformat(earliest_tx[:10]) - datetime.timedelta(days=1)).isoformat()
             except ValueError:
                 pass
-            return min("2020-01-01", earliest_tx)
+            return max(_ACCOUNT_OPEN_DATE, min("2020-01-01", earliest_tx))
         return "2020-01-01"
 
     if balances and balances.accounts:
@@ -611,10 +621,17 @@ def _ensure_fifo_booking_method(content: str) -> str:
     default booking rejects an ambiguous reduction when a symbol has multiple
     open lots. The option is placed next to any existing ``option`` directives so
     the header stays readable; Beancount applies booking globally regardless of
-    position. Content already declaring a booking method is returned unchanged.
+    position. Content already declaring ``FIFO`` is returned unchanged; an
+    existing *incompatible* method (e.g. ``STRICT``, under which the appended
+    ``{}`` reductions remain ambiguous) is rewritten to ``FIFO`` rather than
+    duplicated.
     """
-    if 'option "booking_method"' in content:
-        return content
+    booking_re = re.compile(r'option\s+"booking_method"\s+"([^"]*)"')
+    existing = booking_re.search(content)
+    if existing:
+        if existing.group(1) == "FIFO":
+            return content
+        return booking_re.sub('option "booking_method" "FIFO"', content, count=1)
     option_line = 'option "booking_method" "FIFO"\n'
     lines = content.splitlines(keepends=True)
     insert_at: Optional[int] = None
@@ -1009,13 +1026,18 @@ class BeancountGenerator:
         for h in holdings.holdings:
             ticker = _clean_ticker(h.get("ticker"))
             qty = float(h.get("quantity") or 0.0)
-            if not (ticker and qty > 0):
+            if not (ticker and round(qty, 6) > 0):
                 continue
             firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
             b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type, is_asset=True)
             holding_units[(b_account, ticker)] = holding_units.get((b_account, ticker), 0.0) + qty
 
         for (b_account, ticker), total_qty in sorted(holding_units.items()):
+            # Skip aggregates that cancel to zero at six-decimal precision: the
+            # opening-lot emitter uses the same rounding rule, so asserting a
+            # commodity whose lot was not created would fail the ledger.
+            if round(total_qty, 6) <= 0:
+                continue
             lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
 
     def generate_prices_bean(
@@ -1072,7 +1094,7 @@ class BeancountGenerator:
         aggregated_holdings = self._aggregate_snapshot_holdings(holdings, acct_lookup)
 
         self._emit_snapshot_lots(
-            aggregated_holdings, net_buys, transactions, existing_keys, lot_date, lines
+            aggregated_holdings, net_buys, net_buy_meta, transactions, existing_keys, lot_date, lines
         )
         self._emit_reconstructed_opening_lots(
             net_buys, net_buy_meta, aggregated_holdings, existing_keys, lot_date, transactions, lines
@@ -1121,7 +1143,42 @@ class BeancountGenerator:
         for tx in transactions.transactions:
             self._accumulate_net_buy(tx, acct_lookup, net_buys, net_buy_meta)
 
+        # Second, chronological pass: record the deepest intermediate inventory
+        # deficit per key so a reconstructed opening lot covers a sell-then-buy
+        # sequence whose final net is non-negative (see _emit_reconstructed_opening_lots).
+        self._accumulate_running_deficit(transactions, acct_lookup, net_buy_meta)
+
         return net_buys, net_buy_meta
+
+    def _classify_trade(
+        self,
+        tx: Dict[str, Any],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Optional[Tuple[Tuple[str, str], float, bool, bool, str, float]]:
+        """Resolve a trade to ``(key, qty, is_buy, is_sell, firm, price)`` or ``None``.
+
+        ``None`` for non-trades (no ticker, zero quantity, or neither buy nor sell).
+        """
+        t_ticker = _clean_ticker(tx.get("symbol"))
+        tx_raw_qty = tx.get("quantity")
+        tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
+        if not t_ticker or tx_qty <= 0:
+            return None
+
+        tx_type = clean_api_text(tx.get("transaction_type") or "").strip().lower()
+        inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
+        is_tx_buy = tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest")
+        is_tx_sell = tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal")
+        if not (is_tx_buy or is_tx_sell):
+            return None
+
+        tx_firm, tx_acct_name, tx_acct_type, tx_aid = _resolve_account_from_tx(tx, acct_lookup)
+        tx_b_account = self.mapper.resolve_account(
+            tx_firm, tx_acct_name, tx_aid, account_type=tx_acct_type
+        )
+        tx_raw_price = tx.get("price")
+        tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
+        return (tx_b_account, t_ticker), tx_qty, is_tx_buy, is_tx_sell, tx_firm, tx_price
 
     def _accumulate_net_buy(
         self,
@@ -1131,32 +1188,49 @@ class BeancountGenerator:
         net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]],
     ) -> None:
         """Fold a single trade into the net-buys and opening-lot metadata maps."""
-        t_ticker = _clean_ticker(tx.get("symbol"))
-        tx_raw_qty = tx.get("quantity")
-        tx_qty = abs(float(tx_raw_qty)) if tx_raw_qty is not None else 0.0
-        if not t_ticker or tx_qty <= 0:
+        classified = self._classify_trade(tx, acct_lookup)
+        if classified is None:
             return
-
-        tx_type = clean_api_text(tx.get("transaction_type") or "").strip().lower()
-        inv_type = clean_api_text(tx.get("investment_type") or "").strip().lower()
-        is_tx_buy = tx_type in ("buy", "reinvest") or inv_type in ("buy", "reinvest")
-        is_tx_sell = tx_type in ("sell", "disposal") or inv_type in ("sell", "disposal")
-        if not (is_tx_buy or is_tx_sell):
-            return
-
-        tx_firm, tx_acct_name, tx_acct_type, tx_aid = _resolve_account_from_tx(tx, acct_lookup)
-        tx_b_account = self.mapper.resolve_account(
-            tx_firm, tx_acct_name, tx_aid, account_type=tx_acct_type
-        )
-        key = (tx_b_account, t_ticker)
+        key, tx_qty, is_tx_buy, is_tx_sell, tx_firm, tx_price = classified
         net_buys[key] = net_buys.get(key, 0.0) + (tx_qty if is_tx_buy else -tx_qty)
 
-        tx_raw_price = tx.get("price")
-        tx_price = abs(float(tx_raw_price)) if tx_raw_price is not None else 0.0
         meta = net_buy_meta.setdefault(
             key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
         )
+        if is_tx_sell:
+            # Mark that the baseline opening lot for this key must carry a cost
+            # basis so an empty ``{}`` reduction can book against it.
+            meta["has_sell"] = True
         self._update_net_buy_meta(meta, tx_price, is_tx_buy)
+
+    def _accumulate_running_deficit(
+        self,
+        transactions: DashboardTransactions,
+        acct_lookup: Dict[str, Dict[str, Any]],
+        net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]],
+    ) -> None:
+        """Record per-key ``max_deficit`` = the most-negative running inventory.
+
+        Processing trades in chronological order yields the minimum running
+        cumulative quantity; its negation is the opening quantity needed so the
+        inventory never goes negative, even when the final net is non-negative.
+        """
+        def _tx_date(tx: Dict[str, Any]) -> str:
+            return str(tx.get("transaction_date") or tx.get("date") or "")
+
+        cumulative: Dict[Tuple[str, str], float] = {}
+        for tx in sorted(transactions.transactions, key=_tx_date):
+            classified = self._classify_trade(tx, acct_lookup)
+            if classified is None:
+                continue
+            key, tx_qty, is_tx_buy, _is_sell, tx_firm, _price = classified
+            cumulative[key] = cumulative.get(key, 0.0) + (tx_qty if is_tx_buy else -tx_qty)
+            meta = net_buy_meta.setdefault(
+                key, {"firm": tx_firm, "buy_price": 0.0, "any_price": 0.0}
+            )
+            deficit = -cumulative[key]
+            if deficit > meta.get("max_deficit", 0.0):
+                meta["max_deficit"] = deficit
 
     @staticmethod
     def _update_net_buy_meta(meta: Dict[str, Any], tx_price: float, is_tx_buy: bool) -> None:
@@ -1215,6 +1289,7 @@ class BeancountGenerator:
         self,
         aggregated_holdings: Dict[Tuple[str, str], Dict[str, Any]],
         net_buys: Dict[Tuple[str, str], float],
+        net_buy_meta: Dict[Tuple[str, str], Dict[str, Any]],
         transactions: Optional[DashboardTransactions],
         existing_keys: Set[str],
         lot_date: str,
@@ -1232,15 +1307,23 @@ class BeancountGenerator:
             key = (b_account, ticker)
             # Baseline Opening Qty = Current Snapshot Qty - Net Buys within window.
             baseline_qty = snapshot_qty - net_buys.get(key, 0.0) if has_tx else snapshot_qty
-            # <= 0: position was acquired entirely within the transaction window.
-            if baseline_qty <= 0.000001:
+            # Skip only positions whose baseline rounds to zero at the emitted
+            # six-decimal precision — acquired entirely within the window — so a
+            # legitimate micro-position that still earns a balance assertion
+            # (_emit_commodity_unit_assertions) is not dropped from the opening lot.
+            if round(baseline_qty, 6) <= 0:
                 continue
             holding_tag = f"{b_account}:{ticker}"
             if holding_tag in existing_keys:
                 continue
+            # A sale against this ticker in the window reduces the lot with an
+            # empty ``{}`` cost spec, which Beancount matches only against costed
+            # lots; emit the baseline lot with a cost basis so the sale can book.
+            force_cost = bool(net_buy_meta.get(key, {}).get("has_sell"))
             self._append_snapshot_lot(
                 lines, lot_date, pos.get("firm", _FIRM_BROKERAGE), ticker, holding_tag,
                 b_account, baseline_qty, snapshot_qty, pos.get("price", 0.0), pos.get("cost_basis"),
+                force_cost,
             )
 
     def _append_snapshot_lot(
@@ -1255,6 +1338,7 @@ class BeancountGenerator:
         snapshot_qty: float,
         price: float,
         cost_basis: Optional[float],
+        force_cost: bool = False,
     ) -> None:
         """Append a single snapshot opening-lot directive, scaling cost basis when present."""
         payee_esc = _escape_beancount_string(f"{firm} Portfolio Snapshot")
@@ -1266,6 +1350,13 @@ class BeancountGenerator:
             lines.append(
                 f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
                 f"{{{{{_format_cost(scaled_cost_basis)} USD}}}}\n"
+            )
+        elif force_cost and price > 0:
+            # No reported cost basis, but a sale will reduce this lot: estimate the
+            # lot cost from the snapshot price so an empty ``{}`` reduction matches.
+            lines.append(
+                f"  {b_account:<36} {_format_quantity(qty):>10} {ticker} "
+                f"{{{_format_cost(price)} USD}}\n"
             )
         else:
             lines.append(
@@ -1283,27 +1374,32 @@ class BeancountGenerator:
         transactions: Optional[DashboardTransactions],
         lines: List[str],
     ) -> None:
-        """Reconstruct opening lots for securities present before the window and fully sold within it.
+        """Reconstruct opening lots for securities traded before the window and absent from the snapshot.
 
-        Such a position is absent from the current holdings snapshot, yet its net
-        buys are negative; without a synthetic opening lot the reconstructed sales
-        would reduce an empty inventory and the historical ledger would fail to load.
+        Such a position is absent from the current holdings snapshot, yet the
+        transaction window reduces its inventory below zero at some point; without
+        a synthetic opening lot the reconstructed sales would reduce an empty
+        inventory and the historical ledger would fail to load. The opening
+        quantity must cover the *maximum running deficit*, not merely the final
+        net: a sequence that sells 10 then later buys 10 nets to zero yet the
+        earlier sale still needs 10 opening units to book.
         """
         if not (transactions is not None and transactions.transactions):
             return
-        for key in sorted(net_buys):
+        for key in sorted(net_buy_meta):
             if key in aggregated_holdings:
                 continue
             nb = net_buys.get(key, 0.0)
-            if nb >= -0.000001:
+            meta = net_buy_meta.get(key, {})
+            # Opening units needed = the larger of the net sold quantity and the
+            # deepest intermediate shortfall over the chronological trade sequence.
+            baseline_qty = max(-nb, meta.get("max_deficit", 0.0))
+            if baseline_qty <= 0.000001:
                 continue
             b_account, ticker = key
             holding_tag = f"{b_account}:{ticker}"
             if holding_tag in existing_keys:
                 continue
-
-            baseline_qty = -nb
-            meta = net_buy_meta.get(key, {})
             firm = meta.get("firm") or _FIRM_BROKERAGE
             opening_price = meta.get("buy_price") or meta.get("any_price") or 0.0
 
@@ -1519,8 +1615,14 @@ class BeancountGenerator:
         ticker = ctx["ticker"]
 
         reported_amount = amount
-        if price == 0 and amount > 0 and qty > 0:
-            price = amount / qty
+        if price == 0 and reported_amount > 0 and qty > 0:
+            price = reported_amount / qty
+        # A valid Buy/Reinvest may omit ``amount`` while supplying quantity and
+        # price (fetch_transactions normalizes the missing amount to zero). Derive
+        # the reported cash outflow from qty × price — mirroring the sell path —
+        # so the lot and funding leg are nonzero instead of inventing free shares.
+        if reported_amount == 0 and price > 0 and qty > 0:
+            reported_amount = round(qty * price, 2)
         # Book the lot at an explicit *total* cost so it balances exactly against
         # the cash leg. Per-unit cost syntax ({price USD}) drifts for derived
         # prices and large fractional quantities because Beancount recomputes
@@ -1589,8 +1691,19 @@ class BeancountGenerator:
             lines, ctx["date"], ctx["inv_payee"], ctx["inv_narration"],
             ctx["tag_str"], ctx["tx_id"], ctx["acct_id"],
         )
-        lines.append(f"  {ctx['primary_account']:<36} {ctx['amount']:>8.2f} USD\n")
-        lines.append(f"  {dividend_acct:<36} {-ctx['amount']:>8.2f} USD\n\n")
+        # The shared context stores the magnitude (abs) of the amount, so the
+        # posting direction must come from the transaction flags. A debit or
+        # correction — a negative raw amount, or an explicit cash-out that is not
+        # a credit — reverses a normal dividend receipt: cash leaves the account
+        # and dividend income is reduced, instead of overstating both.
+        raw_amount = float(ctx["tx"].get("amount") or 0.0)
+        is_debit = raw_amount < 0 or (
+            bool(ctx["tx"].get("is_cash_out")) and not ctx["is_credit"]
+        )
+        sign = -1.0 if is_debit else 1.0
+        cash = sign * ctx["amount"]
+        lines.append(f"  {ctx['primary_account']:<36} {cash:>8.2f} USD\n")
+        lines.append(f"  {dividend_acct:<36} {-cash:>8.2f} USD\n\n")
 
     def _emit_standard_tx(self, ctx: Dict[str, Any], lines: List[str]) -> None:
         tx = ctx["tx"]
@@ -1820,7 +1933,12 @@ class BeancountGenerator:
         # earlier release that omitted the option.
         patched_content = _ensure_fifo_booking_method(existing_content)
         if patched_content != existing_content:
-            target.write_text(patched_content, encoding="utf-8")
+            # NOSONAR pythonsecurity:S2083 — false positive. ``target`` is the
+            # path already validated by _prepare_ledger_path (NUL rejection +
+            # leaf-and-parent symlink refusal + resolve()); the taint engine
+            # mislabels the ledger's own read-back content as a path source. The
+            # write target is never derived from untrusted content.
+            target.write_text(patched_content, encoding="utf-8")  # NOSONAR
 
         delta_chunks: List[str] = [
             "\n\n;; ------------------------------------------------------------------------------\n"

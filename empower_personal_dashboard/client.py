@@ -744,6 +744,17 @@ class EmpowerDashboardClient:
                 if normalized_entry is None:
                     continue
                 normalized_histories.append(normalized_entry)
+
+            # When neither the request nor the response supplied the range bounds,
+            # derive them from the normalized point dates. The canonical domain
+            # schema requires both bounds to carry a ``date`` value, so emitting
+            # empty strings would make DashboardHistories.to_dict() invalid and
+            # hide the returned range from consumers.
+            point_dates = [p["date"] for p in normalized_histories if p.get("date")]
+            if not resp_start and point_dates:
+                resp_start = min(point_dates)
+            if not resp_end and point_dates:
+                resp_end = max(point_dates)
         except SessionExpiredError:
             raise
         except Exception as e:

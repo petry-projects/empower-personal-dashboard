@@ -1580,6 +1580,240 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             # No duplicate option is injected when one already exists.
             self.assertEqual(updated.count('option "booking_method" "FIFO"'), 1)
 
+    def test_symbol_less_dividend_posts_to_brokerage_without_balances(self):
+        # A dividend whose optional symbol is null must still be recognised as an
+        # investment and post to the brokerage account, not split into Institution.
+        div_tx = DashboardTransactions(
+            start_date="2024-06-30",
+            end_date="2024-06-30",
+            total_transactions=1,
+            money_in=45.0,
+            money_out=0.0,
+            net_cashflow=45.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-divnull",
+                    "account_name": "Taxable Brokerage",
+                    "transaction_date": "2024-06-30",
+                    "description": "Dividend",
+                    "amount": 45.0,
+                    "is_credit": True,
+                    "is_cash_in": True,
+                    "is_income": True,
+                    "investment_type": "Dividend",
+                    "symbol": None,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(div_tx)
+        self.assertIn("Assets:Brokerage:TaxableBrokerage", output)
+        self.assertNotIn("Assets:Institution", output)
+
+    def test_dividend_debit_correction_reverses_posting_signs(self):
+        # A dividend correction (not a credit, flagged cash-out) reverses the
+        # normal receipt: cash leaves the account and income is reduced.
+        corr_tx = DashboardTransactions(
+            start_date="2024-06-30",
+            end_date="2024-06-30",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=45.0,
+            net_cashflow=-45.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-divcorr",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-06-30",
+                    "description": "Dividend reversal",
+                    "amount": 45.0,
+                    "is_credit": False,
+                    "is_cash_in": False,
+                    "is_cash_out": True,
+                    "is_income": False,
+                    "transaction_type": "Dividend",
+                    "symbol": "VTI",
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(corr_tx, balances=self.balances)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage   -45.00 USD", output)
+        self.assertIn("Income:Dividends                        45.00 USD", output)
+
+    def test_buy_with_missing_amount_derives_cost_from_quantity_and_price(self):
+        # A Buy that omits amount but supplies quantity and price must derive the
+        # cash outflow from qty x price instead of booking free shares.
+        buy_tx = DashboardTransactions(
+            start_date="2024-03-15",
+            end_date="2024-03-15",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[
+                {
+                    "user_transaction_id": "tx-noamt",
+                    "account_id": "ACC-BRK-001",
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "transaction_date": "2024-03-15",
+                    "description": "Buy VTI",
+                    "amount": 0.0,
+                    "transaction_type": "Buy",
+                    "investment_type": "Buy",
+                    "symbol": "VTI",
+                    "price": 52.0,
+                    "quantity": 10.0,
+                }
+            ],
+        )
+        output = self.generator.generate_transactions_bean(buy_tx, balances=self.balances)
+        self.assertIn("10.000000 VTI {{520.000000 USD}}", output)
+        self.assertIn("Assets:AcmeBrokerage:TaxableBrokerage  -520.00 USD", output)
+
+    def test_reconstructs_opening_lot_for_sell_then_buy_net_zero(self):
+        # A sell-10-then-buy-10 sequence nets to zero but the earlier sale needs
+        # an opening lot covering the maximum running deficit, or the sale would
+        # reduce an empty inventory.
+        churn = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            total_transactions=2,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-03-01",
+                    "description": "Sell GE",
+                    "amount": 100.0,
+                    "transaction_type": "Sell",
+                    "symbol": "GE",
+                    "price": 10.0,
+                    "quantity": 10.0,
+                },
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-08-01",
+                    "description": "Buy GE",
+                    "amount": 120.0,
+                    "transaction_type": "Buy",
+                    "symbol": "GE",
+                    "price": 12.0,
+                    "quantity": 10.0,
+                },
+            ],
+        )
+        output = self.generator.generate_holdings_bean(None, transactions=churn)
+        self.assertIn('"GE Opening Position"', output)
+        self.assertIn("10.000000 GE {", output)
+
+    def test_snapshot_lot_without_cost_basis_gets_cost_when_sold(self):
+        # A snapshot holding with no cost basis whose ticker is sold in-window
+        # must emit a costed opening lot so the empty {} reduction can book.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=800.0,
+            holdings=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "ticker": "BND",
+                    "quantity": 10.0,
+                    "price": 80.0,
+                }
+            ],
+        )
+        sale = DashboardTransactions(
+            start_date="2024-01-01",
+            end_date="2024-10-01",
+            total_transactions=1,
+            money_in=160.0,
+            money_out=0.0,
+            net_cashflow=160.0,
+            transactions=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "account_type": "investment",
+                    "transaction_date": "2024-05-01",
+                    "description": "Sell BND",
+                    "amount": 160.0,
+                    "transaction_type": "Sell",
+                    "symbol": "BND",
+                    "price": 80.0,
+                    "quantity": 2.0,
+                }
+            ],
+        )
+        output = self.generator.generate_holdings_bean(holdings, transactions=sale)
+        # Costed lot ({price USD}), not an uncosted @ price annotation.
+        self.assertIn("BND {80.000000 USD}", output)
+        self.assertNotIn("BND @ 80.0000 USD", output)
+
+    def test_micro_position_lot_and_assertion_stay_consistent(self):
+        # A sub-micro position that still rounds to a nonzero six-decimal quantity
+        # must appear in BOTH the opening lot and the balance assertion.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=1.0,
+            holdings=[
+                {
+                    "account_name": "Taxable Brokerage",
+                    "firm_name": "Acme Brokerage",
+                    "ticker": "MCR",
+                    "quantity": 0.0000008,
+                    "price": 100.0,
+                    "cost_basis": 0.00008,
+                }
+            ],
+        )
+        holdings_output = self.generator.generate_holdings_bean(holdings)
+        self.assertIn("0.000001 MCR", holdings_output)
+        assertion_lines: list = []
+        self.generator._emit_commodity_unit_assertions(holdings, {}, assertion_lines)
+        self.assertIn("balance Assets:AcmeBrokerage:TaxableBrokerage 0.000001 MCR", "".join(assertion_lines))
+
+    def test_inferred_opening_date_never_precedes_account_opens(self):
+        from empower_personal_dashboard.beancount import _determine_opening_date
+        pre_2000 = DashboardTransactions(
+            start_date="2000-01-01",
+            end_date="2000-01-01",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[{"transaction_date": "2000-01-01", "amount": 1.0}],
+        )
+        # Earliest trade on 2000-01-01 would subtract to 1999-12-31; clamp to the
+        # 2000-01-01 account-open date so the lot never predates the open.
+        self.assertEqual(_determine_opening_date(pre_2000), "2000-01-01")
+        deep_past = DashboardTransactions(
+            start_date="1998-05-05",
+            end_date="1998-05-05",
+            total_transactions=1,
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=[{"transaction_date": "1998-05-05", "amount": 1.0}],
+        )
+        self.assertEqual(_determine_opening_date(deep_past), "2000-01-01")
+
+    def test_append_replaces_incompatible_strict_booking_with_fifo(self):
+        from empower_personal_dashboard.beancount import _ensure_fifo_booking_method
+        patched = _ensure_fifo_booking_method(
+            'option "booking_method" "STRICT"\n2020-01-01 open Assets:Foo\n'
+        )
+        self.assertIn('option "booking_method" "FIFO"', patched)
+        self.assertNotIn("STRICT", patched)
+        self.assertEqual(patched.count('option "booking_method"'), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -328,6 +328,33 @@ class TestClientDataParsing(unittest.TestCase):
         self.assertEqual(kwargs["data"]["endDate"], "2024-01-31")
 
     @patch("requests.Session.post")
+    def test_fetch_histories_derives_bounds_from_points_when_absent(self, mock_post):
+        # When neither the request nor the response supplies startDate/endDate,
+        # the range bounds are derived from the returned point dates so the
+        # canonical schema's required date bounds are never empty strings.
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {
+                # startDate / endDate omitted by upstream.
+                "histories": [
+                    {"date": "2024-03-02", "netWorth": 100.0},
+                    {"date": "2024-01-01", "netWorth": 90.0},
+                    {"date": "2024-06-15", "netWorth": 110.0},
+                ],
+            },
+        }
+        mock_post.return_value = mock_resp
+
+        histories = self.client.fetch_histories()
+        self.assertEqual(histories.start_date, "2024-01-01")
+        self.assertEqual(histories.end_date, "2024-06-15")
+        exported = histories.to_dict()
+        self.assertEqual(exported["start_date"], "2024-01-01")
+        self.assertEqual(exported["end_date"], "2024-06-15")
+
+    @patch("requests.Session.post")
     def test_fetch_histories_total_assets_fallback_excludes_liabilities(self, mock_post):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
