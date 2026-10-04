@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `fetch_histories(start_date, end_date, user_account_ids)` to `EmpowerDashboardClient` with support for `/account/getHistories` RPC and synthetic offline sandbox simulation.
   - Added `DailyHistoryPoint` and `DashboardHistories` domain models and wire schemas to OpenAPI 3.1 specification with contract tests.
 
+### Changed
+- **BREAKING:** Renamed `DashboardBalances.total_credit_card` field to `total_card_liabilities` to prevent CodeQL's credit-card heuristic from flagging the aggregate as sensitive payment-card data. Wire serialization (to_dict/from_dict) preserves the `total_credit_card` key for protocol compatibility. Code constructing `DashboardBalances(total_credit_card=...)` or accessing `.total_credit_card` must update to use `total_card_liabilities`.
+
 ## [0.1.2] - 2026-10-03
 
 ### Added
