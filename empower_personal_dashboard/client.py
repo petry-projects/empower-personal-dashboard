@@ -760,6 +760,8 @@ class EmpowerDashboardClient:
                 resp_end = start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if not resp_start:
                 resp_start = resp_end
+            elif resp_start > resp_end:
+                resp_end = resp_start
         except SessionExpiredError:
             raise
         except Exception as e:

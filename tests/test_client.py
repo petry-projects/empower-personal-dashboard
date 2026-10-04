@@ -495,6 +495,31 @@ class TestClientDataParsing(unittest.TestCase):
         with self.assertRaises(EmpowerError):
             self.client.fetch_histories(start_date="2024-01-01", end_date="2024-01-01")
 
+    @patch("requests.Session.post")
+    def test_fetch_histories_empty_response_has_valid_bounds(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"spHeader": {"success": True}, "spData": {"histories": []}}
+        mock_post.return_value = mock_resp
+        histories = self.client.fetch_histories()
+        self.assertEqual(histories.total_points, 0)
+        self.assertEqual(histories.start_date, histories.end_date)
+        self.assertRegex(histories.start_date, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(histories.end_date, r"^\d{4}-\d{2}-\d{2}$")
+
+    @patch("requests.Session.post")
+    def test_fetch_histories_empty_response_clamps_missing_end_to_start(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "spHeader": {"success": True},
+            "spData": {"startDate": "2026-06-01", "histories": []},
+        }
+        mock_post.return_value = mock_resp
+        histories = self.client.fetch_histories(start_date="2026-01-01")
+        self.assertEqual(histories.start_date, "2026-06-01")
+        self.assertGreaterEqual(histories.end_date, histories.start_date)
+
 
 class TestClientMockMode(unittest.TestCase):
     def test_offline_sandbox_mock_generators(self):
@@ -518,18 +543,6 @@ class TestClientMockMode(unittest.TestCase):
         self.assertEqual(histories.mode, "sandbox_mock")
         self.assertGreater(histories.total_points, 0)
         self.assertGreater(histories.histories[0]["net_worth"], 0)
-
-    @patch("requests.Session.post")
-    def test_fetch_histories_empty_response_has_valid_bounds(self, mock_post):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"spHeader": {"success": True}, "spData": {"histories": []}}
-        mock_post.return_value = mock_resp
-        client = EmpowerDashboardClient(mock_mode=False)
-        histories = client.fetch_histories()
-        self.assertEqual(histories.total_points, 0)
-        self.assertRegex(histories.start_date, r"^\d{4}-\d{2}-\d{2}$")
-        self.assertRegex(histories.end_date, r"^\d{4}-\d{2}-\d{2}$")
 
     def test_mock_histories_points_stay_within_requested_range(self):
         client = EmpowerDashboardClient(mock_mode=True)
