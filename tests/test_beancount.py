@@ -2000,6 +2000,37 @@ class TestOpeningDateClamp(unittest.TestCase):
         # Account-open floor is preserved
         self.assertEqual(_clamp_before_earliest_trade("2000-01-01", old_txs), "2000-01-01")
 
+    def test_transaction_overrides(self):
+        mapper = BeancountMapper()
+        mapper.transaction_overrides = {
+            "tx-12345": "Expenses:Rental:3535BrokenBow:Repairs",
+        }
+        res = mapper.resolve_category_or_payee(
+            category="Home Improvement",
+            description="The Home Depot",
+            tx_id="tx-12345",
+        )
+        self.assertEqual(res, "Expenses:Rental:3535BrokenBow:Repairs")
+
+        # Fallback when tx_id not in overrides
+        res_default = mapper.resolve_category_or_payee(
+            category="Home Improvement",
+            description="The Home Depot",
+            tx_id="tx-99999",
+        )
+        self.assertEqual(res_default, "Expenses:Uncategorized")
+
+    def test_modular_extra_bean_includes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dest = Path(tmp_dir)
+            extra_bean = dest / "broken_bow.bean"
+            extra_bean.write_text("2026-01-01 * \"Custom\"\n", encoding="utf-8")
+            gen = BeancountGenerator()
+            main_path = gen._write_modular_main(dest, append=False)
+            content = main_path.read_text(encoding="utf-8")
+            self.assertIn('include "broken_bow.bean"', content)
+
 
 if __name__ == "__main__":
     unittest.main()
+

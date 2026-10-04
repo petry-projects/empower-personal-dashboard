@@ -186,7 +186,7 @@ def _format_price(price: float) -> str:
 
 def _parse_simple_yaml(content: str) -> Dict[str, Any]:
     """Lightweight fallback parser for basic YAML mapping files when PyYAML is not installed."""
-    result: Dict[str, Any] = {"accounts": {}, "categories": {}, "regex_rules": []}
+    result: Dict[str, Any] = {"accounts": {}, "categories": {}, "regex_rules": [], "transaction_overrides": {}}
     current_section = None
     current_rule: Dict[str, str] = {}
 
@@ -203,7 +203,7 @@ def _parse_simple_yaml(content: str) -> Dict[str, Any]:
             current_section = line[:-1].strip().lower()
             continue
 
-        if current_section in ("accounts", "categories"):
+        if current_section in ("accounts", "categories", "transaction_overrides"):
             if line.startswith('"'):
                 m = re.match(r'^"([^"]+)"\s*:\s*(.*)$', line)
                 if m:
@@ -377,6 +377,7 @@ class BeancountMapper:
         self.accounts: Dict[str, str] = {}
         self.categories: Dict[str, str] = {}
         self.regex_rules: List[Dict[str, str]] = []
+        self.transaction_overrides: Dict[str, str] = {}
 
         if mapping_path:
             self.load_mapping(mapping_path)
@@ -440,6 +441,12 @@ class BeancountMapper:
         else:
             self.regex_rules = []
 
+        raw_tx_overrides = parsed.get("transaction_overrides")
+        if isinstance(raw_tx_overrides, dict):
+            self.transaction_overrides = {str(k): str(v) for k, v in raw_tx_overrides.items()}
+        else:
+            self.transaction_overrides = {}
+
     def resolve_account(
         self,
         firm_name: str,
@@ -470,10 +477,12 @@ class BeancountMapper:
         category_id: Optional[Union[str, int]] = None,
         transaction_type: Optional[str] = None,
         memo: Optional[str] = None,
+        tx_id: Optional[Union[str, int]] = None,
     ) -> str:
         """Resolve the offsetting balancing leg for a transaction.
 
         Order of precedence:
+        0. Explicit transaction ID override (tx_id).
         1. Regex payee rules (matching description and memo).
         2. Category name overrides from mapping.
         3. Category ID overrides from mapping.
@@ -482,6 +491,10 @@ class BeancountMapper:
         6. Spending transactions -> Expenses:Uncategorized.
         7. Default fallback -> Expenses:Uncategorized.
         """
+        # 0. Check explicit transaction ID override
+        if tx_id is not None and str(tx_id) in self.transaction_overrides:
+            return self.transaction_overrides[str(tx_id)]
+
         combined = f"{description or ''} {memo or ''}".strip()
         desc_clean = clean_api_text(combined)
 
@@ -739,26 +752,30 @@ class BeancountGenerator:
     def __init__(self, mapper: Optional[BeancountMapper] = None):
         self.mapper = mapper or BeancountMapper()
 
-    def generate_main_bean(self) -> str:
+    def generate_main_bean(self, additional_includes: Optional[List[str]] = None) -> str:
         """Generate the root main.bean linking modular components."""
-        return (
-            ";; ==============================================================================\n"
-            ";; Empower Personal Dashboard - Root Beancount Ledger\n"
-            ";; ==============================================================================\n\n"
-            'option "title" "Empower Personal Dashboard Ledger"\n'
-            'option "operating_currency" "USD"\n'
-            'option "booking_method" "FIFO"\n'
-            'option "render_commas" "TRUE"\n\n'
-            'plugin "beancount.plugins.auto_accounts"\n\n'
-            ';; Fava Web Dashboard Display Configuration\n'
-            '1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"\n'
-            '1970-01-01 custom "fava-option" "locale" "en_US"\n\n'
-            'include "accounts.bean"\n'
-            'include "balances.bean"\n'
-            'include "holdings.bean"\n'
-            'include "prices.bean"\n'
-            'include "transactions.bean"\n'
-        )
+        lines = [
+            ";; ==============================================================================\n",
+            ";; Empower Personal Dashboard - Root Beancount Ledger\n",
+            ";; ==============================================================================\n\n",
+            'option "title" "Empower Personal Dashboard Ledger"\n',
+            'option "operating_currency" "USD"\n',
+            'option "booking_method" "FIFO"\n',
+            'option "render_commas" "TRUE"\n\n',
+            'plugin "beancount.plugins.auto_accounts"\n\n',
+            ';; Fava Web Dashboard Display Configuration\n',
+            '1970-01-01 custom "fava-option" "invert-income-liabilities-equity" "true"\n',
+            '1970-01-01 custom "fava-option" "locale" "en_US"\n\n',
+            'include "accounts.bean"\n',
+            'include "balances.bean"\n',
+            'include "holdings.bean"\n',
+            'include "prices.bean"\n',
+            'include "transactions.bean"\n',
+        ]
+        if additional_includes:
+            for inc in sorted(set(additional_includes)):
+                lines.append(f'include "{inc}"\n')
+        return "".join(lines)
 
     def generate_accounts_bean(
         self,
@@ -1779,6 +1796,7 @@ class BeancountGenerator:
             category_id=tx.get("category_id"),
             transaction_type=tx.get("transaction_type"),
             memo=tx.get("original_description"),
+            tx_id=ctx.get("tx_id"),
         )
 
         # Determine double-entry posting signs
@@ -1857,14 +1875,20 @@ class BeancountGenerator:
         """Write or patch main.bean, ensuring the holdings include and FIFO booking option."""
         main_path = dest / "main.bean"
         _verify_not_symlink(main_path)
+        standard_beans = {"main.bean", "accounts.bean", "balances.bean", "holdings.bean", "prices.bean", "transactions.bean"}
+        extra_beans = [p.name for p in dest.glob("*.bean") if p.name not in standard_beans and not p.name.startswith(".")]
+
         if not main_path.exists() or not append:
-            main_path.write_text(self.generate_main_bean(), encoding="utf-8")
+            main_path.write_text(self.generate_main_bean(additional_includes=extra_beans), encoding="utf-8")
             return main_path
         current_main = main_path.read_text(encoding="utf-8")
         updated_main = current_main
         # Ensure holdings.bean include is present if missing
         if 'include "holdings.bean"' not in updated_main:
             updated_main += '\ninclude "holdings.bean"\n'
+        for b in sorted(set(extra_beans)):
+            if f'include "{b}"' not in updated_main:
+                updated_main += f'include "{b}"\n'
         # Ensure a FIFO booking method is declared so appended sale transactions
         # resolve against the oldest lot even when the ledger was created by an
         # earlier release that omitted the option.
