@@ -686,7 +686,7 @@ def _load_balances(args, client, in_balances_file, progress_file):
             print(f"[+] Balances snapshot saved to: {args.output}", file=progress_file)
 
         if args.csv:
-            csv_path = out_path.with_suffix(".csv")
+            csv_path = _safe_output_path(out_path.with_suffix(".csv"))
             export_balances_csv(balances_res, csv_path)
             if not args.quiet:
                 print(f"[+] Balances CSV saved to: {csv_path}", file=progress_file)
@@ -720,7 +720,7 @@ def _load_holdings(args, client, in_holdings_file, progress_file):
             print(f"[+] Holdings snapshot saved to: {args.output_holdings}", file=progress_file)
 
         if args.csv:
-            csv_path = out_path.with_suffix(".csv")
+            csv_path = _safe_output_path(out_path.with_suffix(".csv"))
             export_holdings_csv(holdings_res, csv_path)
             if not args.quiet:
                 print(f"[+] Holdings CSV saved to: {csv_path}", file=progress_file)
@@ -796,7 +796,7 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
             print(f"[+] Transactions saved to: {args.output_transactions}", file=progress_file)
 
         if args.csv:
-            csv_path = out_path.with_suffix(".csv")
+            csv_path = _safe_output_path(out_path.with_suffix(".csv"))
             export_transactions_csv(transactions_res, csv_path)
             if not args.quiet:
                 print(f"[+] Transactions CSV saved to: {csv_path}", file=progress_file)
