@@ -525,7 +525,8 @@ class TestClientMockMode(unittest.TestCase):
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"spHeader": {"success": True}, "spData": {"histories": []}}
         mock_post.return_value = mock_resp
-        histories = self.client.fetch_histories()
+        client = EmpowerDashboardClient(mock_mode=False)
+        histories = client.fetch_histories()
         self.assertEqual(histories.total_points, 0)
         self.assertRegex(histories.start_date, r"^\d{4}-\d{2}-\d{2}$")
         self.assertRegex(histories.end_date, r"^\d{4}-\d{2}-\d{2}$")
