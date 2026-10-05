@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from empower_personal_dashboard.cli import main as cli_main
 
@@ -402,5 +402,49 @@ class TestSafeOutputPath(unittest.TestCase):
                 _safe_output_path(output_inside_link)
 
 
+class TestCliLoginChaining(unittest.TestCase):
+    @patch("empower_personal_dashboard.cli.interactive_login", return_value=0)
+    @patch("empower_personal_dashboard.cli._build_client")
+    def test_login_alone_exits_cleanly(self, mock_build_client, mock_interactive_login):
+        from empower_personal_dashboard.cli import main
+        test_args = ["empower", "--login"]
+        with patch.object(sys, "argv", test_args):
+            ret = main()
+            self.assertEqual(ret, 0)
+            mock_interactive_login.assert_called_once()
+
+    @patch("empower_personal_dashboard.cli.interactive_login", return_value=0)
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_balances")
+    @patch("empower_personal_dashboard.cli._build_client")
+    def test_login_with_all_continues_to_extraction(self, mock_build_client, mock_fetch_balances, mock_interactive_login):
+        from empower_personal_dashboard.cli import main
+        from empower_personal_dashboard.models import DashboardBalances
+        client_mock = MagicMock()
+        client_mock.fetch_balances.return_value = DashboardBalances(
+            as_of_date="2026-10-04",
+            net_worth=1000.0,
+            total_cash=1000.0,
+            total_investment=0.0,
+            total_card_liabilities=0.0,
+            total_loan=0.0,
+            total_mortgage=0.0,
+            total_other_assets=0.0,
+            total_other_liabilities=0.0,
+            accounts=[],
+            mode="live"
+        )
+        client_mock.fetch_holdings.return_value = None
+        client_mock.fetch_transactions.return_value = None
+        mock_build_client.return_value = client_mock
+
+        test_args = ["empower", "--login", "--balances", "--format", "json"]
+        with patch.object(sys, "argv", test_args):
+            ret = main()
+            self.assertEqual(ret, 0)
+            mock_interactive_login.assert_called_once()
+            client_mock.fetch_balances.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
+
