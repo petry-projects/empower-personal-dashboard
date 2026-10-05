@@ -4,7 +4,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/empower-personal-dashboard.svg)](https://pypi.org/project/empower-personal-dashboard/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/petry-projects/.github/blob/main/CONTRIBUTING.md)
 [![Privacy: Zero-PII](https://img.shields.io/badge/privacy-Zero--PII-success.svg)](AGENTS.md#2-zero-pii--privacy-strict-mandate)
 
 A standalone, modern Python client and CLI for **Empower Personal Dashboard** (formerly **Personal Capital**).
@@ -47,6 +47,7 @@ This library provides full programmatic and CLI access to:
 - [Security & Privacy Model](#security--privacy-model)
 - [Development & Testing](#development--testing)
 - [Contributing & Agent Standards](#contributing--agent-standards)
+- [Commercial Support & Enterprise Services](#-commercial-support--enterprise-services)
 - [License](#license)
 
 ---
@@ -411,9 +412,26 @@ python3 -m compileall empower_personal_dashboard tests
 
 ## Contributing & Agent Standards
 
-- **[CONTRIBUTING.md](CONTRIBUTING.md)**: Guidelines for opening issues, reporting API changes, coding conventions, and pull request workflows.
+- **[CONTRIBUTING.md](https://github.com/petry-projects/.github/blob/main/CONTRIBUTING.md)**: Guidelines for opening issues, reporting API changes, coding conventions, pull request workflows, and contributor licensing.
 - **[AGENTS.md](AGENTS.md)**: Canonical development standards, Test-Driven Development (TDD) rules, and security guidelines for AI coding agents (extending [`petry-projects/.github/AGENTS.md`](https://github.com/petry-projects/.github/blob/main/AGENTS.md)).
 - **[CLAUDE.md](CLAUDE.md)**: Agent instructions for Claude Code.
+
+---
+
+## 💼 Commercial Support & Enterprise Services
+
+This project is open source and free for the community. For enterprise deployments, proprietary integration, and priority service, commercial support and custom engineering are provided through [CombSmith LLC](https://combsmith.com):
+
+- **Standard SLA & Priority Support:** $199/month per organization
+  - Guaranteed 24-hour issue triage
+  - Dedicated private communications channel
+  - Upstream bug-fix and security patch prioritization
+- **Custom MCP Development & Architecture Advisory:** $250/hour
+  - Custom tool, prompt, and resource connector implementation
+  - Security audit and containerized deployment assistance
+  - Tailored agentic workflow integration
+
+For commercial invoicing, custom service agreements, or enterprise purchase orders, contact **support@combsmith.com** or visit [combsmith.com](https://combsmith.com).
 
 ---
 
