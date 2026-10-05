@@ -960,7 +960,7 @@ def main() -> int:
     client = _build_client(args)
 
     if args.login:
-        return interactive_login(
+        ret = interactive_login(
             client=client,
             session_file=args.session_file,
             cli_email=args.email,
@@ -968,6 +968,11 @@ def main() -> int:
             cli_mode=args.mode,
             cli_code=args.code,
         )
+        if ret != 0:
+            return ret
+        # If user only requested login setup without extraction targets, exit cleanly
+        if not (args.balances or args.holdings or args.transactions or args.all or args.beancount):
+            return 0
 
     # Validate mutually exclusive ledger flags
     if getattr(args, "append", False) and getattr(args, "overwrite_ledger", False):
