@@ -90,6 +90,7 @@ Documentation = "https://github.com/petry-projects/empower-personal-dashboard#re
 Changelog = "https://github.com/petry-projects/empower-personal-dashboard/blob/main/CHANGELOG.md"
 Issues = "https://github.com/petry-projects/empower-personal-dashboard/issues"
 Repository = "https://github.com/petry-projects/empower-personal-dashboard.git"
+"Commercial Support" = "https://combsmith.com"
 
 [tool.setuptools.packages.find]
 where = ["."]
