@@ -805,6 +805,13 @@ def _read_existing_transaction_records(path):
     p = Path(path)
     if not p.exists():
         return []
+    expanded = Path(os.path.expanduser(str(p)))
+    if expanded.is_symlink():
+        raise ValueError(f"Refusing to read from symlinked path: {path}")
+    for parent in expanded.parents:
+        if parent.is_symlink():
+            raise ValueError(f"Refusing to read from path inside symlinked directory: {path}")
+    p = expanded.resolve()
     if str(p).endswith(".jsonl"):
         records = []
         with open(p, "r", encoding="utf-8") as f:
@@ -907,6 +914,7 @@ def _fetch_transactions(args, client, progress_file):
     if existing_records:
         fetched_count = len(transactions_res.transactions)
         merged = merge_transaction_records(existing_records, transactions_res.transactions)
+        merged.sort(key=lambda t: t.get("transaction_date", ""), reverse=True)
         transactions_res = _summarize_transactions(merged, mode=transactions_res.mode)
         if not args.quiet:
             print(
