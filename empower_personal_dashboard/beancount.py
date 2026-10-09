@@ -1018,7 +1018,8 @@ class BeancountGenerator:
         self._emit_cash_liability_assertions(
             balances, transactions, acct_lookup, commodity_accounts, lines
         )
-        self._emit_commodity_unit_assertions(holdings, acct_lookup, lines)
+        reconciled_keys = self._shortfall_reconciled_keys(holdings, transactions, acct_lookup)
+        self._emit_commodity_unit_assertions(holdings, acct_lookup, lines, reconciled_keys)
 
         return "".join(lines)
 
@@ -1058,29 +1059,80 @@ class BeancountGenerator:
                 lines.append(f"2020-01-01 pad {b_account} {ACCT_OPENING_BALANCES}\n")
             lines.append(f"{as_of} balance {b_account} {bal_amt:.2f} {curr}\n")
 
+    def _shortfall_reconciled_keys(
+        self,
+        holdings: Optional[DashboardHoldings],
+        transactions: Optional[DashboardTransactions],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Set[Tuple[str, str]]:
+        """Return the (b_account, ticker) keys that get a deficit-floor shortfall reconciliation.
+
+        Mirrors the floor-surplus detection in :meth:`_emit_snapshot_lots`: a
+        still-held long position whose opening lot is floored above
+        ``snapshot - net_buys`` ends the window with surplus units that an
+        explicit reconciliation disposes on the day *after* the snapshot. Only
+        the balance assertion for one of these keys must wait a further day so
+        the reconciliation posts first; every other assertion stays at D+1.
+        """
+        reconciled: Set[Tuple[str, str]] = set()
+        if not (transactions and transactions.transactions):
+            return reconciled
+        if not (holdings and holdings.holdings and holdings.as_of_date):
+            return reconciled
+        net_buys, net_buy_meta = self._compute_net_buys(transactions, acct_lookup)
+        aggregated = self._aggregate_snapshot_holdings(holdings, acct_lookup)
+        for key, pos in aggregated.items():
+            naive_baseline = pos.get("quantity", 0.0) - net_buys.get(key, 0.0)
+            # The floor is a long-only construct; a negative naive baseline stays
+            # negative and never earns a reconciliation.
+            if naive_baseline < 0:
+                continue
+            max_deficit = net_buy_meta.get(key, {}).get("max_deficit", 0.0)
+            baseline_qty = max(naive_baseline, max_deficit)
+            # A baseline rounding to zero emits no opening lot (hence no
+            # reconciliation), matching the _emit_snapshot_lots skip.
+            if round(baseline_qty, 6) == 0:
+                continue
+            if round(baseline_qty - naive_baseline, 6) > 0:
+                reconciled.add(key)
+        return reconciled
+
     def _emit_commodity_unit_assertions(
         self,
         holdings: Optional[DashboardHoldings],
         acct_lookup: Dict[str, Dict[str, Any]],
         lines: List[str],
+        reconciled_keys: Optional[Set[Tuple[str, str]]] = None,
     ) -> None:
-        """Emit aggregated per-(account, ticker) commodity unit balance assertions."""
+        """Emit aggregated per-(account, ticker) commodity unit balance assertions.
+
+        Beancount evaluates balance directives at the beginning of the day, so a
+        trade dated on ``as_of`` has not yet posted when an assertion dated
+        ``as_of`` is checked. Asserting the snapshot on the following day (D+1)
+        therefore counts all same-day activity — the date used for an ordinary
+        position.
+
+        Only a position carrying a deficit-floor shortfall reconciliation (which
+        posts on D+1, after same-day activity) has its assertion pushed one more
+        day forward (D+2) so the reconciliation is applied before the balance is
+        checked. Delaying *every* assertion to D+2 would make an unreconciled
+        position wrongly absorb a genuine D+1 trade in that commodity, which on
+        append invalidates the preserved assertion.
+        """
         if not (holdings and holdings.holdings):
             return
+        reconciled_keys = reconciled_keys or set()
         as_of = holdings.as_of_date
-        # Beancount evaluates balance directives at the beginning of the day,
-        # so a trade dated on as_of has not yet posted when an assertion dated
-        # as_of is checked. Asserting the snapshot on the following day counts
-        # all same-day activity. Since deficit-floor shortfall reconciliations
-        # also post on the following day, move the assertion one more day forward
-        # to ensure the shortfall is applied before checking the balance.
         try:
-            assert_date = (
-                datetime.date.fromisoformat(as_of) + datetime.timedelta(days=2)
-            ).isoformat()
+            base = datetime.date.fromisoformat(as_of)
+            next_day = (base + datetime.timedelta(days=1)).isoformat()
+            reconciled_day = (base + datetime.timedelta(days=2)).isoformat()
         except Exception:
-            assert_date = as_of
-        lines.append(f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, asserted {assert_date})\n")
+            next_day = reconciled_day = as_of
+        lines.append(
+            f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, "
+            f"asserted D+1 — or D+2 for a position with a shortfall reconciliation)\n"
+        )
         # Aggregate positions by (b_account, ticker) to avoid duplicate conflicting balance assertions
         holding_units: Dict[Tuple[str, str], float] = {}
         for h in holdings.holdings:
@@ -1102,6 +1154,7 @@ class BeancountGenerator:
             # (short) aggregates are asserted as negative unit balances.
             if round(total_qty, 6) == 0:
                 continue
+            assert_date = reconciled_day if (b_account, ticker) in reconciled_keys else next_day
             lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
 
     def generate_prices_bean(
@@ -1521,7 +1574,15 @@ class BeancountGenerator:
             pass
         lines.append(f'{reconciliation_date} * "{payee_esc}" "{narration_esc}"\n')
         lines.append(f'  empower_holding: "{holding_tag}"\n')
-        equity_amount = round(surplus * price, 2) if price > 0 else 0.0
+        # Derive the USD leg from the *formatted* quantity and price actually
+        # emitted on the posting below (six- and four-decimal rounding). Computing
+        # it from the raw inputs can disagree with the rounded posting by cents
+        # (e.g. 10,000 units @ $12.34567), leaving the transaction unbalanced.
+        equity_amount = (
+            round(float(_format_quantity(surplus)) * float(_format_price(price)), 2)
+            if price > 0
+            else 0.0
+        )
         if equity_amount > 0:
             lines.append(
                 f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} @ {_format_price(price)} USD\n"

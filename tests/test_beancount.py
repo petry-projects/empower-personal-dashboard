@@ -347,11 +347,12 @@ class TestBeancountGenerator(unittest.TestCase):
         self.assertIn("2026-10-01 balance Assets:AllyBank:EverydayChecking 5000.00 USD", output)
         # Credit liability balance is asserted as negative in Beancount
         self.assertIn("2026-10-01 balance Liabilities:Chase:SapphireReserve -2000.00 USD", output)
-        # Commodity balance assertions are dated two days after the snapshot:
-        # +1 day to count same-day trades, +1 more day to allow deficit-floor
-        # shortfall reconciliations to post before the balance check.
-        self.assertIn("2026-10-03 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
-        self.assertIn("2026-10-03 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
+        # Commodity balance assertions are dated the day after the snapshot (D+1)
+        # so same-day trades are counted. These positions carry no deficit-floor
+        # shortfall reconciliation (no transactions here), so they stay at D+1
+        # rather than being pushed to D+2.
+        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
+        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
 
     def test_generate_prices_bean(self):
         output = self.generator.generate_prices_bean(self.synthetic_holdings)
@@ -1358,14 +1359,17 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         self.assertIn('2022-03-10 * "Acme Brokerage" "Buy AAPL"', tx_output)
 
         # Final commodity balance assertions are dated the day after the snapshot
-        # (2024-10-02) and assert full portfolio snapshot quantities: 60 VTI and 15 AAPL
+        # (2024-10-02) and assert full portfolio snapshot quantities: 60 VTI and 15 AAPL.
+        # Neither position is deficit-floored (VTI nets +10 with no intermediate
+        # deficit; AAPL's baseline is zero), so no shortfall reconciliation posts
+        # and both assertions stay at D+1 rather than D+2.
         bal_output = self.generator.generate_balances_bean(
             balances=self.balances,
             holdings=self.holdings_snapshot,
             transactions=self.transactions_history,
         )
-        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
-        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
 
     def test_modular_ledger_export_lifecycle_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2022,6 +2026,49 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         )
         output = self.generator.generate_holdings_bean(holdings, transactions=churn)
         self.assertIn("10.000000 GE {", output)
+
+    def test_only_reconciled_assertion_is_delayed_to_two_days(self):
+        # GE is deficit-floored (sell 10 then buy 10, net 0, snapshot 5) so it
+        # carries a shortfall reconciliation that posts on D+1; its assertion must
+        # wait until D+2. VTI nets +20 with no intermediate deficit, so it has no
+        # reconciliation and its assertion stays at D+1. Blanket-delaying every
+        # assertion to D+2 would make VTI's assertion wrongly absorb a genuine
+        # D+1 trade on append (see beancount.py:1079 review).
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=16860.0,
+            holdings=[
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "ticker": "GE", "quantity": 5.0, "price": 12.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "ticker": "VTI", "quantity": 60.0, "price": 280.0, "cost_basis": 12600.0},
+            ],
+        )
+        txns = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=3,
+            money_in=100.0, money_out=4120.0, net_cashflow=-4020.0,
+            transactions=[
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2024-03-01",
+                 "description": "Sell GE", "amount": 100.0, "is_cash_in": True,
+                 "is_credit": True, "transaction_type": "Sell", "symbol": "GE",
+                 "price": 10.0, "quantity": 10.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2024-08-01",
+                 "description": "Buy GE", "amount": 120.0, "is_cash_out": True,
+                 "transaction_type": "Buy", "symbol": "GE",
+                 "price": 12.0, "quantity": 10.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2021-06-15",
+                 "description": "Buy VTI", "amount": 4000.0, "is_cash_out": True,
+                 "transaction_type": "Buy", "symbol": "VTI",
+                 "price": 200.0, "quantity": 20.0},
+            ],
+        )
+        bal_output = self.generator.generate_balances_bean(holdings=holdings, transactions=txns)
+        # Reconciled GE waits for D+2; unreconciled VTI stays at D+1.
+        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 5.000000 GE", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
 
     def test_inferred_opening_date_never_precedes_account_opens(self):
         from empower_personal_dashboard.beancount import _determine_opening_date
