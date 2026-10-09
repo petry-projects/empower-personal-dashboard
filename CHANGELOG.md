@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Hardened Beancount growth-curve reconstruction with real ledger-load validation ([#48](https://github.com/petry-projects/empower-personal-dashboard/issues/48)):
+  - Preserved negative (short) snapshot quantities end to end — negative opening lots and negative commodity unit balance assertions — keeping a current short distinct from a fully-sold security.
+  - Emitted an explicit shortfall reconciliation when the intra-window running-deficit floor over-provisions an opening lot, so the reconstructed final quantity still matches the asserted snapshot.
+  - Persisted the exported window-start boundary in `holdings.bean` and reject (`LedgerAppendError`) an append that broadens the window into the past, which would leave the already-exported opening lot stale.
+  - Added `EmpowerDashboardClient.reconcile_transaction_window(...)` guard for an incomplete transaction window (ends before `holdings.as_of_date`) with a `warn` / `error` / `extend` contract, raising `ReconstructionWindowError` under the `error` policy.
+  - Added a real Beancount loader (`beancount>=3.0`, test extra only) to the test suite so generated ledgers are validated by `beancount.loader.load_string`, not string matching.
+
 ## [0.3.0] - 2026-10-10
 
 ### Added

@@ -12,7 +12,9 @@ from .client import (
 )
 from .exceptions import (
     EmpowerError,
+    LedgerAppendError,
     LoginFailedException,
+    ReconstructionWindowError,
     RequireTwoFactorException,
     SessionExpiredError,
 )
@@ -55,6 +57,8 @@ __all__ = [
     "RequireTwoFactorException",
     "SessionExpiredError",
     "LoginFailedException",
+    "ReconstructionWindowError",
+    "LedgerAppendError",
     "clean_api_text",
     "DEFAULT_BASE_URL",
     "MIGRATED_BASE_URL",
