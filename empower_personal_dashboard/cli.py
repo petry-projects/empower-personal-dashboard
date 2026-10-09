@@ -682,7 +682,7 @@ def _atomic_write(out_path: Path, write_body) -> None:
         if out_path.exists():
             os.chmod(tmp_file, out_path.stat().st_mode & 0o777)
         os.replace(tmp_file, out_path)
-    except BaseException:
+    except Exception:
         if tmp_file.exists():
             tmp_file.unlink()
         raise
@@ -843,10 +843,10 @@ def _read_existing_transaction_records(path):
     if not expanded.exists():
         return []
     if expanded.is_symlink():
-        raise ValueError(f"Refusing to read from symlinked path: {path}")
+        raise _ArchiveReadError(f"Refusing to read from symlinked path: {path}")
     for parent in expanded.parents:
         if parent.is_symlink():
-            raise ValueError(f"Refusing to read from path inside symlinked directory: {path}")
+            raise _ArchiveReadError(f"Refusing to read from path inside symlinked directory: {path}")
     p = expanded.resolve()
     try:
         text = p.read_text(encoding="utf-8")
@@ -875,9 +875,9 @@ def _read_existing_transaction_records(path):
     records = data.get("transactions", []) if isinstance(data, dict) else data
     if not isinstance(records, list):
         raise _ArchiveReadError(f"{path} does not contain a list of transactions.")
-    for index, rec in enumerate(records):
+    for idx, rec in enumerate(records):
         if not isinstance(rec, dict):
-            raise _ArchiveReadError(f"{path} transaction entry {index} is not a JSON object.")
+            raise _ArchiveReadError(f"{path} transaction entry {idx} is not a JSON object.")
     return list(records)
 
 
