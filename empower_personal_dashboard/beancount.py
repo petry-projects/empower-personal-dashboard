@@ -1502,13 +1502,20 @@ class BeancountGenerator:
         ``snapshot - net_buys``, the reconstructed inventory ends the window with
         ``surplus`` extra units that the snapshot assertion does not expect. The
         exact timing is unknowable (same-day sell/buy ordering), so the surplus is
-        reconciled explicitly against ``Equity:Opening-Balances`` on the snapshot
-        date — before the next-day unit assertion — rather than silently breaking
+        reconciled explicitly against ``Equity:Opening-Balances`` on the day after
+        the snapshot — after same-day activity — rather than silently breaking
         the ledger. The ``{}`` reduction books FIFO against the floored opening lot.
         """
         payee_esc = _escape_beancount_string(f"{firm} Snapshot Shortfall Reconciliation")
         narration_esc = _escape_beancount_string(f"{ticker} Deficit Floor Adjustment")
-        lines.append(f'{snapshot_date} * "{payee_esc}" "{narration_esc}"\n')
+        reconciliation_date = snapshot_date
+        try:
+            reconciliation_date = (
+                datetime.date.fromisoformat(snapshot_date) + datetime.timedelta(days=1)
+            ).isoformat()
+        except (TypeError, ValueError):
+            pass
+        lines.append(f'{reconciliation_date} * "{payee_esc}" "{narration_esc}"\n')
         lines.append(f'  empower_holding: "{holding_tag}"\n')
         lines.append(
             f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}\n"
