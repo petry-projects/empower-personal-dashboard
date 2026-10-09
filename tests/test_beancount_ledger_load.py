@@ -15,10 +15,13 @@ from pathlib import Path
 try:
     from beancount import loader
     _HAS_BEANCOUNT = True
-except ImportError:  # pragma: no cover - exercised on Python 3.9 CI leg
-    # ``beancount>=3.0`` is gated to Python >= 3.10 in the test extra (its early
-    # 3.0.x releases dropped 3.9), so on 3.9 the real loader is unavailable and
-    # these validation tests are skipped rather than erroring at import time.
+except ImportError as e:
+    # On Python 3.10+, beancount is required by the test extra, so unexpected
+    # import errors from within beancount should bubble up. On 3.9, beancount is
+    # not available at all, so silently mark tests skipped.
+    import sys
+    if sys.version_info >= (3, 10) and 'beancount' not in str(e):
+        raise
     loader = None
     _HAS_BEANCOUNT = False
 

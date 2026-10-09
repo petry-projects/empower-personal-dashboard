@@ -2166,6 +2166,13 @@ class BeancountGenerator:
         existing_content = target.read_text(encoding="utf-8")
         existing_ids = set(re.findall(r'empower_id:\s*"([^"]+)"', existing_content))
 
+        # Validate that the append won't broaden the transaction window into the
+        # past before writing any patches to the file. The guard must run with
+        # the same lot_date resolution as generate_holdings_bean.
+        if holdings or (transactions and transactions.transactions):
+            lot_date = self._resolve_lot_date(holdings, effective_opening_date, transactions, balances)
+            self._guard_window_not_broadened(existing_content, lot_date)
+
         # Ensure a FIFO booking method is declared so appended sale transactions
         # resolve against the oldest lot even when the file was created by an
         # earlier release that omitted the option.
