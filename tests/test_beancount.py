@@ -2059,7 +2059,7 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
                  "transaction_type": "Buy", "symbol": "GE",
                  "price": 12.0, "quantity": 10.0},
                 {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
-                 "account_type": "investment", "transaction_date": "2021-06-15",
+                 "account_type": "investment", "transaction_date": "2024-08-15",
                  "description": "Buy VTI", "amount": 4000.0, "is_cash_out": True,
                  "transaction_type": "Buy", "symbol": "VTI",
                  "price": 200.0, "quantity": 20.0},
