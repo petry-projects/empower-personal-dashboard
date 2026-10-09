@@ -667,14 +667,12 @@ def _atomic_write(out_path: Path, write_body) -> None:
     ``write_body`` receives the open text handle. A crash, full disk or
     serialization error part-way through leaves the previous file untouched
     instead of truncated — which matters most for a merged multi-year archive.
-    An existing file keeps its permission bits; a new one gets the umask default.
+    An existing file keeps its permission bits; a new one gets 0o644 (rw-r--r--).
     """
     if out_path.exists():
         mode = out_path.stat().st_mode & 0o777
     else:
-        umask = os.umask(0)
-        os.umask(umask)
-        mode = 0o666 & ~umask
+        mode = 0o644
     fd, tmp_file = tempfile.mkstemp(dir=out_path.parent, prefix=f".{out_path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
