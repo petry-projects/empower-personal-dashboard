@@ -470,11 +470,11 @@ class EmpowerDashboardClient:
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         session_data = {
-            "version": 1,
+            "version": 2,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "base_url": self.base_url,
             "csrf": self.csrf,
-            "cookies": requests.utils.dict_from_cookiejar(self.session.cookies),
+            "cookies": self._serialize_cookies(),
         }
 
         fd, tmp_file = tempfile.mkstemp(dir=target_path.parent, prefix=".session_", suffix=".tmp")
@@ -492,6 +492,59 @@ class EmpowerDashboardClient:
         self._log_debug(f"Saved session to {target_path} (base_url: {self.base_url}, csrf: {self.csrf[:8]}...)")
         return target_path
 
+    def _serialize_cookies(self) -> List[Dict[str, Any]]:
+        """Serialize the cookie jar preserving full per-cookie attributes.
+
+        ``dict_from_cookiejar`` flattens the jar to ``{name: value}``, discarding
+        domain/path/secure/expires and silently overwriting same-name cookies
+        scoped to different domains or paths. Emitting one dict per cookie keeps
+        every attribute so downstream edge filters and load balancers route and
+        scope the cookies correctly after a reload.
+        """
+        serialized: List[Dict[str, Any]] = []
+        for cookie in self.session.cookies:
+            serialized.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": bool(cookie.secure),
+                    "expires": cookie.expires,
+                    "http_only": cookie.has_nonstandard_attr("HttpOnly"),
+                }
+            )
+        return serialized
+
+    def _load_cookies(self, cookies: Any) -> None:
+        """Rehydrate the session cookie jar from a serialized session file.
+
+        The current format (version 2) stores cookies as a list of attribute
+        dicts; each is recreated with its full domain/path/secure/expires scope.
+        A legacy plain ``{name: value}`` dict falls back to ``update()`` so
+        session files written before this change keep working.
+        """
+        if isinstance(cookies, list):
+            for entry in cookies:
+                if not isinstance(entry, dict) or "name" not in entry:
+                    continue
+                rest = {}
+                if entry.get("http_only"):
+                    rest["HttpOnly"] = True
+                cookie = requests.cookies.create_cookie(
+                    name=entry["name"],
+                    value=entry.get("value", ""),
+                    domain=entry.get("domain", "") or "",
+                    path=entry.get("path", "/") or "/",
+                    secure=bool(entry.get("secure", False)),
+                    expires=entry.get("expires"),
+                    rest=rest,
+                )
+                self.session.cookies.set_cookie(cookie)
+        elif isinstance(cookies, dict):
+            # Legacy flattened {name: value} format.
+            self.session.cookies.update(cookies)
+
     def load_session(self, filepath: Optional[Union[str, Path]] = None) -> bool:
         """Load session cookies and CSRF token from saved file."""
         target_path = Path(filepath or self.session_file)
@@ -507,8 +560,7 @@ class EmpowerDashboardClient:
                 self.base_url = data["base_url"].rstrip("/")
                 self.api_endpoint = f"{self.base_url}/api"
 
-            cookies = data.get("cookies", {})
-            self.session.cookies.update(cookies)
+            self._load_cookies(data.get("cookies", {}))
             self._log_debug(f"Loaded session from {target_path} (base_url: {self.base_url}, csrf: {self.csrf[:8]}...)")
             return True
         except Exception as e:

@@ -44,6 +44,101 @@ class TestClientSessionPersistence(unittest.TestCase):
             self.assertEqual(new_client.csrf, "test-csrf-token-abc")
             self.assertEqual(new_client.session.cookies.get("JSESSIONID"), "cookie-12345")
 
+    def test_saved_cookies_are_list_of_attribute_dicts(self):
+        # The new on-disk format serializes cookies as a list of attribute
+        # dicts (not a flattened {name: value} map), bumping the version to 2.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            client.session.cookies.set(
+                "JSESSIONID", "abc", domain="pc-api.empower-retirement.com", path="/"
+            )
+
+            client.save_session(session_file)
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(data["version"], 2)
+            self.assertIsInstance(data["cookies"], list)
+            entry = data["cookies"][0]
+            self.assertEqual(entry["name"], "JSESSIONID")
+            self.assertEqual(entry["value"], "abc")
+            self.assertEqual(entry["domain"], "pc-api.empower-retirement.com")
+            self.assertEqual(entry["path"], "/")
+            self.assertIn("secure", entry)
+            self.assertIn("expires", entry)
+
+    def test_round_trip_preserves_full_cookie_attributes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            client.session.cookies.set(
+                "JSESSIONID",
+                "cookie-12345",
+                domain="pc-api.empower-retirement.com",
+                path="/api",
+                secure=True,
+                expires=2000000000,
+                rest={"HttpOnly": True},
+            )
+
+            client.save_session(session_file)
+
+            new_client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            self.assertTrue(new_client.load_session(session_file))
+
+            loaded = next(iter(new_client.session.cookies))
+            self.assertEqual(loaded.name, "JSESSIONID")
+            self.assertEqual(loaded.value, "cookie-12345")
+            self.assertEqual(loaded.domain, "pc-api.empower-retirement.com")
+            self.assertEqual(loaded.path, "/api")
+            self.assertTrue(loaded.secure)
+            self.assertEqual(loaded.expires, 2000000000)
+            self.assertTrue(loaded.has_nonstandard_attr("HttpOnly"))
+
+    def test_same_name_cookies_across_domains_are_both_retained(self):
+        # dict_from_cookiejar collapsed same-name cookies to one entry; the full
+        # serialization must keep both the apex and host-scoped variants.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            client.session.cookies.set(
+                "JSESSIONID", "host-value", domain="pc-api.empower-retirement.com", path="/"
+            )
+            client.session.cookies.set(
+                "JSESSIONID", "apex-value", domain=".empower-retirement.com", path="/"
+            )
+
+            client.save_session(session_file)
+
+            new_client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            self.assertTrue(new_client.load_session(session_file))
+
+            values = {
+                c.domain: c.value
+                for c in new_client.session.cookies
+                if c.name == "JSESSIONID"
+            }
+            self.assertEqual(values["pc-api.empower-retirement.com"], "host-value")
+            self.assertEqual(values[".empower-retirement.com"], "apex-value")
+
+    def test_legacy_plain_dict_cookies_still_load(self):
+        # Backward compatibility: a pre-existing session file whose "cookies"
+        # field is a flat {name: value} dict must still load via update().
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_file = Path(tmpdir) / "session.json"
+            legacy = {
+                "version": 1,
+                "base_url": "https://pc-api.empower-retirement.com",
+                "csrf": "legacy-csrf",
+                "cookies": {"JSESSIONID": "legacy-cookie"},
+            }
+            session_file.write_text(json.dumps(legacy), encoding="utf-8")
+
+            client = EmpowerDashboardClient(session_file=session_file, mock_mode=False)
+            self.assertTrue(client.load_session(session_file))
+            self.assertEqual(client.csrf, "legacy-csrf")
+            self.assertEqual(client.session.cookies.get("JSESSIONID"), "legacy-cookie")
+
     def test_load_nonexistent_session_returns_false(self):
         client = EmpowerDashboardClient(session_file=Path("/nonexistent/file.json"), mock_mode=False)
         self.assertFalse(client.load_session())
