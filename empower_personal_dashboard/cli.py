@@ -802,10 +802,9 @@ def merge_transaction_records(existing, incoming):
 
 def _read_existing_transaction_records(path):
     """Load transaction records from an existing ``.jsonl`` or ``.json`` output file."""
-    p = Path(path)
-    if not p.exists():
+    expanded = Path(os.path.expanduser(str(path)))
+    if not expanded.exists():
         return []
-    expanded = Path(os.path.expanduser(str(p)))
     if expanded.is_symlink():
         raise ValueError(f"Refusing to read from symlinked path: {path}")
     for parent in expanded.parents:
