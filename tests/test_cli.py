@@ -670,6 +670,25 @@ class TestCliMerge(unittest.TestCase):
             self.assertEqual(out.stat().st_mode & 0o777, 0o640)
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_new_archive_honours_umask(self, mock_txs):
+        # A brand-new archive must get the process umask default, exactly as a
+        # plain open() would: a strict umask keeps financial data owner-only.
+        mock_txs.return_value = self._mk_result([
+            {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+        ])
+        for umask, expected in ((0o077, 0o600), (0o022, 0o644)):
+            with self.subTest(umask=oct(umask)), tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir) / "transactions.jsonl"
+                previous = os.umask(umask)
+                try:
+                    code, _ = self._run_merge(out)
+                finally:
+                    os.umask(previous)
+                self.assertEqual(code, 0)
+                self.assertEqual(out.stat().st_mode & 0o777, expected)
+                self.assertEqual(sorted(p.name for p in Path(tmpdir).iterdir()), ["transactions.jsonl"])
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_refuses_corrupt_jsonl_archive(self, mock_txs):
         # A malformed line must stop the merge before anything is fetched or
         # written; skipping it would silently drop history on the rewrite.

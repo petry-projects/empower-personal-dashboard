@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import sys
-import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -667,23 +667,24 @@ def _atomic_write(out_path: Path, write_body) -> None:
     ``write_body`` receives the open text handle. A crash, full disk or
     serialization error part-way through leaves the previous file untouched
     instead of truncated — which matters most for a merged multi-year archive.
-    An existing file keeps its permission bits; a new one gets 0o644 (rw-r--r--).
+
+    The temp file is created with an exclusive ``open``, so the OS applies the
+    process umask exactly as it would for a direct write: a new file gets the
+    umask default without the umask ever being read or changed. An existing
+    file keeps its permission bits.
     """
-    if out_path.exists():
-        mode = out_path.stat().st_mode & 0o777
-    else:
-        mode = 0o644
-    fd, tmp_file = tempfile.mkstemp(dir=out_path.parent, prefix=f".{out_path.name}.", suffix=".tmp")
+    tmp_file = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(tmp_file, "x", encoding="utf-8") as f:
             write_body(f)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp_file, mode)
+        if out_path.exists():
+            os.chmod(tmp_file, out_path.stat().st_mode & 0o777)
         os.replace(tmp_file, out_path)
     except BaseException:
-        if os.path.exists(tmp_file):
-            os.remove(tmp_file)
+        if tmp_file.exists():
+            tmp_file.unlink()
         raise
 
 
