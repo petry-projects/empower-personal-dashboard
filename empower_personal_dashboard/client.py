@@ -500,6 +500,13 @@ class EmpowerDashboardClient:
         scoped to different domains or paths. Emitting one dict per cookie keeps
         every attribute so downstream edge filters and load balancers route and
         scope the cookies correctly after a reload.
+
+        The complete record is preserved, not just ``HttpOnly``: the entire
+        ``rest`` map (so sibling REST attributes such as ``SameSite`` survive)
+        and the scope flags (``domain_specified`` et al.). ``create_cookie``
+        derives those flags from the values, so a host-only cookie — whose
+        ``domain`` is nonempty yet ``domain_specified`` is ``False`` — would
+        otherwise come back domain-scoped and leak to matching subdomains.
         """
         serialized: List[Dict[str, Any]] = []
         for cookie in self.session.cookies:
@@ -508,10 +515,19 @@ class EmpowerDashboardClient:
                     "name": cookie.name,
                     "value": cookie.value,
                     "domain": cookie.domain,
+                    "domain_specified": bool(cookie.domain_specified),
+                    "domain_initial_dot": bool(cookie.domain_initial_dot),
                     "path": cookie.path,
+                    "path_specified": bool(cookie.path_specified),
                     "secure": bool(cookie.secure),
                     "expires": cookie.expires,
-                    "http_only": cookie.has_nonstandard_attr("HttpOnly"),
+                    "port": cookie.port,
+                    "port_specified": bool(cookie.port_specified),
+                    "version": cookie.version,
+                    "discard": bool(cookie.discard),
+                    "rfc2109": bool(cookie.rfc2109),
+                    # The full nonstandard-attribute map (HttpOnly, SameSite, …).
+                    "rest": dict(cookie._rest),
                 }
             )
         return serialized
@@ -520,17 +536,23 @@ class EmpowerDashboardClient:
         """Rehydrate the session cookie jar from a serialized session file.
 
         The current format (version 2) stores cookies as a list of attribute
-        dicts; each is recreated with its full domain/path/secure/expires scope.
-        A legacy plain ``{name: value}`` dict falls back to ``update()`` so
-        session files written before this change keep working.
+        dicts; each is recreated with its full domain/path/secure/expires scope,
+        REST attributes, and scope flags. A legacy plain ``{name: value}`` dict
+        falls back to ``update()`` so session files written before this change
+        keep working.
         """
         if isinstance(cookies, list):
             for entry in cookies:
                 if not isinstance(entry, dict) or "name" not in entry:
                     continue
-                rest = {}
-                if entry.get("http_only"):
-                    rest["HttpOnly"] = True
+                # Prefer the full REST map; fall back to the earlier
+                # ``http_only``-only field so sessions written by prior builds
+                # of this format still rehydrate HttpOnly correctly.
+                rest = entry.get("rest")
+                if not isinstance(rest, dict):
+                    rest = {}
+                    if entry.get("http_only"):
+                        rest["HttpOnly"] = True
                 cookie = requests.cookies.create_cookie(
                     name=entry["name"],
                     value=entry.get("value", ""),
@@ -538,8 +560,25 @@ class EmpowerDashboardClient:
                     path=entry.get("path", "/") or "/",
                     secure=bool(entry.get("secure", False)),
                     expires=entry.get("expires"),
-                    rest=rest,
+                    port=entry.get("port"),
+                    version=entry.get("version", 0),
+                    discard=bool(entry.get("discard", False)),
+                    rfc2109=bool(entry.get("rfc2109", False)),
+                    rest=dict(rest),
                 )
+                # ``create_cookie`` recomputes the scope flags from the values,
+                # which flips a host-only cookie (nonempty domain, but
+                # domain_specified False) to domain-scoped. Restore the
+                # persisted flags so the cookie keeps its original scope and is
+                # not sent to matching subdomains after a reload.
+                if "domain_specified" in entry:
+                    cookie.domain_specified = bool(entry["domain_specified"])
+                if "domain_initial_dot" in entry:
+                    cookie.domain_initial_dot = bool(entry["domain_initial_dot"])
+                if "path_specified" in entry:
+                    cookie.path_specified = bool(entry["path_specified"])
+                if "port_specified" in entry:
+                    cookie.port_specified = bool(entry["port_specified"])
                 self.session.cookies.set_cookie(cookie)
         elif isinstance(cookies, dict):
             # Legacy flattened {name: value} format.
