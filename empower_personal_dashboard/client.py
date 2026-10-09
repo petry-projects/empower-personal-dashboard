@@ -183,6 +183,16 @@ class EmpowerDashboardClient:
     def _setup_logging(self) -> None:
         """Configure debug logging handlers."""
         if not self.logger.handlers:
+            # Validate the (possibly CLI/LLM-supplied) log path *before* registering
+            # any handlers. If validation fails it raises here, leaving the
+            # process-wide logger untouched so a later client with a valid
+            # `log_file` can still configure it (handlers stay empty). Otherwise a
+            # rejected path would leave the console handler attached and the guard
+            # above would skip setup for every subsequent client.
+            log_path = None
+            if self.log_file:
+                log_path = _safe_fs_path(self.log_file, description="log file path")
+
             self.logger.setLevel(logging.DEBUG if self.debug else logging.INFO)
             formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -191,10 +201,7 @@ class EmpowerDashboardClient:
             console_handler.setFormatter(formatter)
             self.logger.addHandler(console_handler)
 
-            if self.log_file:
-                # Validate the (possibly CLI/LLM-supplied) log path before creating
-                # directories or opening the file, to prevent path traversal.
-                log_path = _safe_fs_path(self.log_file, description="log file path")
+            if log_path is not None:
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
                 file_handler.setLevel(logging.DEBUG)

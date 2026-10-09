@@ -69,6 +69,7 @@ class TestClientSessionPersistence(unittest.TestCase):
         # to run regardless of test ordering.
         logger = _logging.getLogger("EmpowerDashboardClient")
         saved_handlers = logger.handlers[:]
+        saved_level = logger.level
         for h in saved_handlers:
             logger.removeHandler(h)
         try:
@@ -84,6 +85,9 @@ class TestClientSessionPersistence(unittest.TestCase):
                 logger.removeHandler(h)
             for h in saved_handlers:
                 logger.addHandler(h)
+            # `_setup_logging` mutates the process-wide logger level; restore it so
+            # this test does not alter shared logging state for later tests.
+            logger.setLevel(saved_level)
 
     def test_load_nonexistent_session_returns_false(self):
         client = EmpowerDashboardClient(session_file=Path("/nonexistent/file.json"), mock_mode=False)
