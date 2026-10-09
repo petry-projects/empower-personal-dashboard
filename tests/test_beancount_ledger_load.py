@@ -16,11 +16,11 @@ try:
     from beancount import loader
     _HAS_BEANCOUNT = True
 except ImportError as e:
-    # On Python 3.10+, beancount is required by the test extra, so unexpected
-    # import errors from within beancount should bubble up. On 3.9, beancount is
-    # not available at all, so silently mark tests skipped.
+    # On Python 3.10+, beancount is required by the test extra, so every
+    # ImportError should bubble up. On 3.9, beancount is not available at all,
+    # so silently mark tests skipped.
     import sys
-    if sys.version_info >= (3, 10) and 'beancount' not in str(e):
+    if sys.version_info >= (3, 10):
         raise
     loader = None
     _HAS_BEANCOUNT = False
