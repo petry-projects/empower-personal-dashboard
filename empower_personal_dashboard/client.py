@@ -65,6 +65,32 @@ def _env_flag(value: Optional[str]) -> bool:
     return value.strip().lower() not in _FALSY_ENV_VALUES
 
 
+def _safe_fs_path(filepath: Union[str, Path], *, description: str) -> Path:
+    """Resolve and validate a user-supplied filesystem path before any write.
+
+    Guards against path traversal from untrusted (e.g. CLI- or LLM-supplied)
+    arguments: rejects embedded NUL bytes and refuses to follow a symlink at the
+    target or anywhere in its parent chain, either of which could redirect the
+    write outside the intended location. Returns the resolved absolute path.
+    Mirrors the ``_safe_output_path``/``_prepare_ledger_path`` guards used in
+    ``cli.py`` and ``beancount.py``.
+    """
+    raw = str(filepath)
+    if "\x00" in raw:
+        raise ValueError(f"{description} must not contain NUL bytes.")
+    expanded = Path(filepath).expanduser()
+    # Inspect the user-supplied location for a symlink *before* resolving it:
+    # ``Path.resolve()`` follows symlinks, so a post-resolve check never sees one.
+    if expanded.is_symlink():
+        raise ValueError(f"Refusing to write to symlinked {description}: {expanded}")
+    # A symlink anywhere in the parent chain can redirect the write just as a
+    # symlinked leaf can; reject every symlinked parent before resolving.
+    for parent in expanded.parents:
+        if parent.is_symlink():
+            raise ValueError(f"Refusing to write to {description} inside symlinked directory: {expanded}")
+    return expanded.resolve()
+
+
 def _clean_history_balances(raw_balances: Any) -> Dict[str, float]:
     """Sanitize a raw per-account balances map, dropping textual annotation siblings."""
     clean_balances: Dict[str, float] = {}
@@ -166,8 +192,11 @@ class EmpowerDashboardClient:
             self.logger.addHandler(console_handler)
 
             if self.log_file:
-                self.log_file.parent.mkdir(parents=True, exist_ok=True)
-                file_handler = logging.FileHandler(self.log_file, mode="a", encoding="utf-8")
+                # Validate the (possibly CLI/LLM-supplied) log path before creating
+                # directories or opening the file, to prevent path traversal.
+                log_path = _safe_fs_path(self.log_file, description="log file path")
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
                 file_handler.setLevel(logging.DEBUG)
                 file_handler.setFormatter(formatter)
                 self.logger.addHandler(file_handler)
@@ -485,7 +514,9 @@ class EmpowerDashboardClient:
         """
         Atomically save session cookies and CSRF token with private POSIX owner-only permissions (0600).
         """
-        target_path = Path(filepath or self.session_file)
+        # Validate the (possibly CLI/LLM-supplied) session path before creating
+        # directories or writing the file, to prevent path traversal.
+        target_path = _safe_fs_path(filepath or self.session_file, description="session file path")
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         session_data = {

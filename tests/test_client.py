@@ -44,6 +44,47 @@ class TestClientSessionPersistence(unittest.TestCase):
             self.assertEqual(new_client.csrf, "test-csrf-token-abc")
             self.assertEqual(new_client.session.cookies.get("JSESSIONID"), "cookie-12345")
 
+    def test_save_session_rejects_symlinked_target(self):
+        # A user-/LLM-supplied session path that is a symlink could redirect the
+        # write outside the intended location (path traversal, SonarCloud S2083).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real = Path(tmpdir) / "real_session.json"
+            real.write_text("{}", encoding="utf-8")
+            link = Path(tmpdir) / "link_session.json"
+            link.symlink_to(real)
+            client = EmpowerDashboardClient(session_file=Path(tmpdir) / "x.json", mock_mode=True)
+            with self.assertRaises(ValueError):
+                client.save_session(link)
+
+    def test_save_session_rejects_nul_byte_path(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        with self.assertRaises(ValueError):
+            client.save_session("/tmp/bad\x00name.json")
+
+    def test_setup_logging_rejects_symlinked_log_file(self):
+        import logging as _logging
+
+        # `_setup_logging` only configures handlers when none are attached yet;
+        # the logger is a process-wide singleton, so clear it to force the guard
+        # to run regardless of test ordering.
+        logger = _logging.getLogger("EmpowerDashboardClient")
+        saved_handlers = logger.handlers[:]
+        for h in saved_handlers:
+            logger.removeHandler(h)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                real = Path(tmpdir) / "real.log"
+                real.write_text("", encoding="utf-8")
+                link = Path(tmpdir) / "link.log"
+                link.symlink_to(real)
+                with self.assertRaises(ValueError):
+                    EmpowerDashboardClient(log_file=link, mock_mode=True)
+        finally:
+            for h in logger.handlers[:]:
+                logger.removeHandler(h)
+            for h in saved_handlers:
+                logger.addHandler(h)
+
     def test_load_nonexistent_session_returns_false(self):
         client = EmpowerDashboardClient(session_file=Path("/nonexistent/file.json"), mock_mode=False)
         self.assertFalse(client.load_session())
