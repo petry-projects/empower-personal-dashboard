@@ -377,6 +377,169 @@ class TestCLI(unittest.TestCase):
         self.assertIsNone(kwargs.get("limit"))
 
 
+class TestMergeTransactionRecords(unittest.TestCase):
+    def test_updates_in_place_appends_and_preserves_order(self):
+        from empower_personal_dashboard.cli import merge_transaction_records
+
+        existing = [
+            {"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0, "status": "posted"},
+            {"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.0, "status": "pending"},
+        ]
+        incoming = [
+            {"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.25, "status": "posted"},
+            {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0, "status": "posted"},
+        ]
+
+        merged = merge_transaction_records(existing, incoming)
+
+        ids = [m["user_transaction_id"] for m in merged]
+        # Stable order: preserved historical first, then original position of TX2, then new TX3
+        self.assertEqual(ids, ["OLD1", "TX2", "TX3"])
+        # Historical record outside the queried window is preserved untouched
+        self.assertEqual(merged[0]["description"], "Old")
+        # Matching record updated in place (pending -> posted, revised amount)
+        self.assertEqual(merged[1]["status"], "posted")
+        self.assertEqual(merged[1]["amount"], 5.25)
+
+    def test_preserves_records_without_id(self):
+        from empower_personal_dashboard.cli import merge_transaction_records
+
+        existing = [
+            {"transaction_date": "2019-05-01", "description": "No id", "amount": 1.0},
+            {"user_transaction_id": "A", "description": "has id", "amount": 2.0},
+        ]
+        incoming = [
+            {"user_transaction_id": "A", "description": "updated", "amount": 3.0},
+        ]
+
+        merged = merge_transaction_records(existing, incoming)
+        self.assertEqual(len(merged), 2)
+        # Keyless historical record survives
+        self.assertTrue(any(m.get("description") == "No id" for m in merged))
+        # Keyed record updated
+        self.assertEqual(next(m for m in merged if m.get("user_transaction_id") == "A")["amount"], 3.0)
+
+
+class TestCliMerge(unittest.TestCase):
+    def _mk_result(self, transactions):
+        from empower_personal_dashboard.models import DashboardTransactions
+
+        return DashboardTransactions(
+            start_date="2026-09-01",
+            end_date="2026-10-01",
+            total_transactions=len(transactions),
+            money_in=0.0,
+            money_out=0.0,
+            net_cashflow=0.0,
+            transactions=transactions,
+        )
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_jsonl_preserves_history_and_applies_updates(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0, "status": "posted"}) + "\n"
+                + json.dumps({"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.0, "status": "pending"}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.25, "status": "posted"},
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0, "status": "posted"},
+            ])
+
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--output-transactions", str(out),
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+            by_id = {r["user_transaction_id"]: r for r in records}
+            self.assertIn("OLD1", by_id)  # historical outside the window preserved
+            self.assertEqual(by_id["TX2"]["status"], "posted")  # updated in place
+            self.assertEqual(by_id["TX2"]["amount"], 5.25)
+            self.assertIn("TX3", by_id)  # new appended
+            self.assertEqual(len(records), 3)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_json_output(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.json"
+            out.write_text(json.dumps({
+                "start_date": "2020-01-15",
+                "end_date": "2026-09-01",
+                "total_transactions": 1,
+                "transactions": [
+                    {"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0},
+                ],
+            }), encoding="utf-8")
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+            ])
+
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--output-transactions", str(out),
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            data = json.loads(out.read_text(encoding="utf-8"))
+            ids = {t["user_transaction_id"] for t in data["transactions"]}
+            self.assertEqual(ids, {"OLD1", "TX3"})
+            self.assertEqual(data["total_transactions"], 2)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_auto_detects_earliest_start_date(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n"
+                + json.dumps({"user_transaction_id": "OLD2", "transaction_date": "2021-06-10", "description": "Older", "amount": 20.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([])
+
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--output-transactions", str(out),
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            mock_txs.assert_called_once()
+            _, kwargs = mock_txs.call_args
+            # Earliest archived transaction date is queried forward
+            self.assertEqual(kwargs.get("start_date"), "2020-01-15")
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_explicit_start_date_overrides_earliest_detection(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([])
+
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--start-date", "2025-01-01",
+                "--output-transactions", str(out),
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            _, kwargs = mock_txs.call_args
+            self.assertEqual(kwargs.get("start_date"), "2025-01-01")
+
+
 class TestSafeOutputPath(unittest.TestCase):
     def test_resolves_regular_path_and_rejects_symlink(self):
         from empower_personal_dashboard.cli import _safe_output_path

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Intelligent delta merge for transaction archives ([#51](https://github.com/petry-projects/empower-personal-dashboard/issues/51)):
+  - Added `--merge` CLI flag that merges freshly fetched transactions into an existing `--output-transactions` file (`.jsonl` or `.json`) by `user_transaction_id`. Matching records are updated in place (e.g. `status` revised from `pending` to `posted`, revised amounts/dates), new records are appended, and older historical transactions outside the queried window are preserved — so a default ~90-day fetch no longer clobbers a multi-year archive.
+  - Added earliest-date auto-detection: when `--merge` is set, `--start-date` is omitted, and the target file exists, the CLI queries from the earliest archived transaction date forward.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added

@@ -161,6 +161,17 @@ def parse_args() -> argparse.Namespace:
         help="Path to YAML/JSON Beancount account/category mapping configuration.",
     )
     parser.add_argument(
+        "--merge",
+        action="store_true",
+        help=(
+            "Merge freshly fetched transactions into an existing --output-transactions "
+            "file by user_transaction_id: matching records are updated in place, new "
+            "records appended, and older historical records (outside the queried window) "
+            "preserved. When --start-date is omitted and the file exists, the earliest "
+            "archived transaction date is auto-detected and queried forward."
+        ),
+    )
+    parser.add_argument(
         "--overwrite-ledger",
         "--overwrite",
         action="store_true",
@@ -728,13 +739,8 @@ def _load_holdings(args, client, in_holdings_file, progress_file):
     return holdings_res
 
 
-def _parse_transactions_jsonl(in_t):
-    tx_list = []
-    with open(in_t, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                tx_list.append(json.loads(line))
+def _summarize_transactions(tx_list, mode="historical"):
+    """Build a DashboardTransactions summary (date span + cashflow) over a list of records."""
     dates = [t.get("transaction_date") for t in tx_list if t.get("transaction_date")]
     s_date = min(dates) if dates else "2026-01-01"
     e_date = max(dates) if dates else "2026-12-31"
@@ -748,8 +754,78 @@ def _parse_transactions_jsonl(in_t):
         money_out=round(m_out, 2),
         net_cashflow=round(m_in - m_out, 2),
         transactions=tx_list,
-        mode="historical",
+        mode=mode,
     )
+
+
+def _parse_transactions_jsonl(in_t):
+    tx_list = []
+    with open(in_t, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                tx_list.append(json.loads(line))
+    return _summarize_transactions(tx_list)
+
+
+def merge_transaction_records(existing, incoming):
+    """Merge ``incoming`` transaction records into ``existing`` by ``user_transaction_id``.
+
+    - Records whose ``user_transaction_id`` matches an existing record are updated in
+      place with the incoming version (e.g. ``status`` revised from ``pending`` to
+      ``posted``, revised amounts or dates), preserving the original position so the
+      archive's historical ordering stays stable.
+    - Records carrying a new ``user_transaction_id`` are appended.
+    - Existing records absent from ``incoming`` — older historical transactions outside
+      the queried window — are preserved untouched.
+
+    Records lacking a ``user_transaction_id`` cannot be keyed, so they are preserved as-is
+    (existing ones kept, incoming ones appended).
+    """
+    merged = []
+    index = {}  # user_transaction_id -> position in merged
+    for rec in existing:
+        tid = rec.get("user_transaction_id")
+        if tid:
+            index[str(tid)] = len(merged)
+        merged.append(dict(rec))
+    for rec in incoming:
+        tid = rec.get("user_transaction_id")
+        if tid and str(tid) in index:
+            merged[index[str(tid)]] = dict(rec)
+        else:
+            if tid:
+                index[str(tid)] = len(merged)
+            merged.append(dict(rec))
+    return merged
+
+
+def _read_existing_transaction_records(path):
+    """Load transaction records from an existing ``.jsonl`` or ``.json`` output file."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    if str(p).endswith(".jsonl"):
+        records = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return list(data.get("transactions", []))
+    if isinstance(data, list):
+        return list(data)
+    return []
+
+
+def _earliest_transaction_date(records):
+    """Return the lexicographically earliest ISO ``transaction_date`` among records, or None."""
+    dates = [str(r.get("transaction_date")) for r in records if r.get("transaction_date")]
+    return min(dates) if dates else None
 
 
 def _load_transactions_from_file(args, in_transactions_file, progress_file):
@@ -805,6 +881,19 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
 def _fetch_transactions(args, client, progress_file):
     start_date = args.start_date
     end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Merge mode: load any existing archive up front so the fetched window can be
+    # delta-merged into it rather than clobbering multi-year history.
+    existing_records = None
+    if getattr(args, "merge", False) and args.output_transactions:
+        existing_records = _read_existing_transaction_records(args.output_transactions)
+        if existing_records and not start_date:
+            earliest = _earliest_transaction_date(existing_records)
+            if earliest:
+                start_date = earliest
+                if not args.quiet:
+                    print(f"[*] Merge: querying from earliest archived date {earliest} forward.", file=progress_file)
+
     # Beancount reconstruction requires complete transaction history, not truncated.
     # Apply limit only for display purposes (via render functions), not the fetch.
     tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
@@ -814,6 +903,18 @@ def _fetch_transactions(args, client, progress_file):
         user_account_ids=args.account_id,
         limit=tx_limit,
     )
+
+    if existing_records:
+        fetched_count = len(transactions_res.transactions)
+        merged = merge_transaction_records(existing_records, transactions_res.transactions)
+        transactions_res = _summarize_transactions(merged, mode=transactions_res.mode)
+        if not args.quiet:
+            print(
+                f"[+] Merge: {fetched_count} fetched transaction(s) merged into "
+                f"{len(existing_records)} archived ({len(merged)} total).",
+                file=progress_file,
+            )
+
     t_data = transactions_res.to_dict()
     t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
 
