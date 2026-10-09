@@ -195,19 +195,28 @@ class EmpowerDashboardClient:
     def _get_csrf_from_homepage(self) -> Optional[str]:
         """Fetch homepage and extract initial CSRF token from window.csrf.
 
-        The request is issued through an isolated, throwaway ``requests.Session``
-        rather than ``self.session``. Hitting the login landing page makes
-        Empower emit a fresh, unauthenticated ``JSESSIONID`` / ``REMEMBER_ME_COOKIE``
-        in ``Set-Cookie``; using ``self.session`` would update its cookie jar
-        in-place and clobber the active authenticated ``JSESSIONID`` on an
-        already-logged-in client (issue #53). Only the scraped CSRF token is
-        returned; ``self.session.cookies`` is left untouched.
+        On authenticated clients (carrying cookies), the request uses an isolated,
+        throwaway ``requests.Session`` to avoid clobbering the active authenticated
+        ``JSESSIONID`` with the unauthenticated one emitted by the login landing
+        page (issue #53). On first-time logins (no cookies), the request uses
+        ``self.session`` to preserve any session cookie Empower issues, which may
+        be required for the subsequent login POST. Only the CSRF token is scraped
+        and returned; ``self.session.cookies`` is left untouched on authenticated
+        clients.
         """
         url = f"{self.base_url}/page/login/goHome" if "empower-retirement" in self.base_url else self.base_url
         self._log_debug(f"Fetching homepage CSRF from {url}...")
         try:
-            with requests.Session() as scrape_session:
-                r = scrape_session.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+            # Use a throwaway session only if the client already carries cookies
+            # (authenticated case), to avoid clobbering with unauthenticated JSESSIONID.
+            # For fresh logins, use self.session to preserve the homepage's session
+            # cookie, which may be required for the login POST (issue #53 mitigation).
+            if self.session.cookies:
+                with requests.Session() as scrape_session:
+                    r = scrape_session.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+            else:
+                r = self.session.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+
             m = CSRF_REGEX.search(r.text)
             if m:
                 token = m.group(1)
