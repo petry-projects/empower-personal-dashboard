@@ -672,17 +672,20 @@ def _atomic_write(out_path: Path, write_body) -> None:
     The temp file is created with an exclusive ``open``, so the OS applies the
     process umask exactly as it would for a direct write: a new file gets the
     umask default without the umask ever being read or changed. An existing
-    file keeps its permission bits.
+    file keeps its permission bits, and they are applied to the still-empty
+    temp file before any content is written, so an owner-only archive is never
+    staged in a more widely readable file.
     """
+    existing_mode = out_path.stat().st_mode & 0o777 if out_path.exists() else None
     tmp_file = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     replaced = False
     try:
         with open(tmp_file, "x", encoding="utf-8") as f:
+            if existing_mode is not None:
+                os.chmod(tmp_file, existing_mode)
             write_body(f)
             f.flush()
             os.fsync(f.fileno())
-        if out_path.exists():
-            os.chmod(tmp_file, out_path.stat().st_mode & 0o777)
         os.replace(tmp_file, out_path)
         replaced = True
     finally:
@@ -836,9 +839,14 @@ class _ArchiveReadError(ValueError):
 
 
 def _parse_jsonl_archive(text, path):
-    """Parse a ``.jsonl`` archive: one JSON object per non-blank line."""
+    """Parse a ``.jsonl`` archive: one JSON object per non-blank line.
+
+    Lines are split on LF only. ``str.splitlines`` would also break on U+2028,
+    U+2029 and other separators that are legal inside a JSON string and that the
+    writer emits raw (``ensure_ascii=False``).
+    """
     records = []
-    for lineno, line in enumerate(text.splitlines(), 1):
+    for lineno, line in enumerate(text.split("\n"), 1):
         line = line.strip()
         if not line:
             continue

@@ -690,6 +690,57 @@ class TestCliMerge(unittest.TestCase):
                 self.assertEqual(out.stat().st_mode & 0o777, expected)
                 self.assertEqual(sorted(p.name for p in Path(tmpdir).iterdir()), ["transactions.jsonl"])
 
+    def test_existing_archive_mode_applies_before_content_is_written(self):
+        # An owner-only archive must never be staged in a wider temp file: the
+        # existing mode is applied before any content is written, not after.
+        from empower_personal_dashboard.cli import _atomic_write
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text("{}\n", encoding="utf-8")
+            os.chmod(out, 0o600)
+            seen = []
+
+            def write_body(f):
+                temp_files = [p for p in Path(tmpdir).iterdir() if p.name != out.name]
+                seen.extend(p.stat().st_mode & 0o777 for p in temp_files)
+                f.write("{}\n")
+
+            previous = os.umask(0o022)
+            try:
+                _atomic_write(out, write_body)
+            finally:
+                os.umask(previous)
+
+            self.assertEqual(seen, [0o600])
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_keeps_records_containing_unicode_line_separators(self, mock_txs):
+        # U+2028/U+2029 are legal inside JSON strings and are written raw
+        # (ensure_ascii=False). They must not be treated as record boundaries.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            description = "Line one\u2028line two\u2029end"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": description, "amount": 10.0}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+            ])
+
+            code, err = self._run_merge(out)
+            self.assertEqual(code, 0, err)
+            # A second merge must be able to read what the first one wrote.
+            code, err = self._run_merge(out)
+            self.assertEqual(code, 0, err)
+
+            records = [json.loads(line) for line in out.read_text(encoding="utf-8").split("\n") if line.strip()]
+            by_id = {r["user_transaction_id"]: r for r in records}
+            self.assertEqual(sorted(by_id), ["OLD1", "TX3"])
+            self.assertEqual(by_id["OLD1"]["description"], description)
+
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_refuses_corrupt_jsonl_archive(self, mock_txs):
         # A malformed line must stop the merge before anything is fetched or
