@@ -131,6 +131,35 @@ class TestClientAuthentication(unittest.TestCase):
 
         self.assertIn("empower-retirement.com", self.client.base_url)
 
+    @patch("empower_personal_dashboard.client.requests.Session")
+    def test_get_csrf_from_homepage_uses_isolated_session(self, mock_session_cls):
+        # An already-authenticated client carries an active JSESSIONID. Scraping
+        # the homepage for a fresh CSRF token must not clobber that cookie with
+        # the unauthenticated JSESSIONID the login landing page emits (issue #53).
+        authed_jsessionid = "authenticated-jsessionid"
+        self.client.session.cookies.set("JSESSIONID", authed_jsessionid)
+        # Guard: the active authenticated session must never be used to scrape.
+        self.client.session.get = MagicMock(
+            side_effect=AssertionError("active session must not be used for CSRF scrape")
+        )
+
+        scratch_session = MagicMock()
+        scratch_resp = MagicMock()
+        scratch_resp.text = "<html>window.csrf = 'scraped-csrf';</html>"
+        scratch_session.get.return_value = scratch_resp
+        scratch_session.__enter__.return_value = scratch_session
+        scratch_session.__exit__.return_value = False
+        mock_session_cls.return_value = scratch_session
+
+        token = self.client._get_csrf_from_homepage()
+
+        self.assertEqual(token, "scraped-csrf")
+        # A fresh, throwaway session was constructed for the scrape.
+        mock_session_cls.assert_called_once_with()
+        scratch_session.get.assert_called_once()
+        # The active authenticated cookie survived the scrape untouched.
+        self.assertEqual(self.client.session.cookies.get("JSESSIONID"), authed_jsessionid)
+
     @patch("requests.Session.post")
     def test_request_2fa_challenge_sms(self, mock_post):
         self.client.csrf = "csrf-token"

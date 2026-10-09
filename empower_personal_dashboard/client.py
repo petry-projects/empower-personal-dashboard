@@ -193,11 +193,21 @@ class EmpowerDashboardClient:
         return data
 
     def _get_csrf_from_homepage(self) -> Optional[str]:
-        """Fetch homepage and extract initial CSRF token from window.csrf."""
+        """Fetch homepage and extract initial CSRF token from window.csrf.
+
+        The request is issued through an isolated, throwaway ``requests.Session``
+        rather than ``self.session``. Hitting the login landing page makes
+        Empower emit a fresh, unauthenticated ``JSESSIONID`` / ``REMEMBER_ME_COOKIE``
+        in ``Set-Cookie``; using ``self.session`` would update its cookie jar
+        in-place and clobber the active authenticated ``JSESSIONID`` on an
+        already-logged-in client (issue #53). Only the scraped CSRF token is
+        returned; ``self.session.cookies`` is left untouched.
+        """
         url = f"{self.base_url}/page/login/goHome" if "empower-retirement" in self.base_url else self.base_url
         self._log_debug(f"Fetching homepage CSRF from {url}...")
         try:
-            r = self.session.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+            with requests.Session() as scrape_session:
+                r = scrape_session.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
             m = CSRF_REGEX.search(r.text)
             if m:
                 token = m.group(1)
