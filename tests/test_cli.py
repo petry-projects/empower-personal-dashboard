@@ -659,7 +659,9 @@ class TestCliMerge(unittest.TestCase):
                 json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n",
                 encoding="utf-8",
             )
-            os.chmod(out, 0o640)
+            # Owner-only, with an execute bit no umask default can produce, so the
+            # assertion below can only pass if the existing mode was carried over.
+            os.chmod(out, 0o700)
             mock_txs.return_value = self._mk_result([
                 {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
             ])
@@ -667,7 +669,7 @@ class TestCliMerge(unittest.TestCase):
             code, _ = self._run_merge(out)
 
             self.assertEqual(code, 0)
-            self.assertEqual(out.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(out.stat().st_mode & 0o777, 0o700)
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_new_archive_honours_umask(self, mock_txs):

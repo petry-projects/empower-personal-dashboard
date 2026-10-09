@@ -53,6 +53,7 @@ DEFAULT_OUTPUT_DIR = Path.cwd() / "data"
 DEFAULT_BALANCES_FILE = DEFAULT_OUTPUT_DIR / "empower_balances.json"
 DEFAULT_HOLDINGS_FILE = DEFAULT_OUTPUT_DIR / "empower_holdings.json"
 DEFAULT_TRANSACTIONS_FILE = DEFAULT_OUTPUT_DIR / "empower_transactions.jsonl"
+_JSONL_SUFFIX = ".jsonl"
 
 
 def parse_args() -> argparse.Namespace:
@@ -674,6 +675,7 @@ def _atomic_write(out_path: Path, write_body) -> None:
     file keeps its permission bits.
     """
     tmp_file = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    replaced = False
     try:
         with open(tmp_file, "x", encoding="utf-8") as f:
             write_body(f)
@@ -682,10 +684,11 @@ def _atomic_write(out_path: Path, write_body) -> None:
         if out_path.exists():
             os.chmod(tmp_file, out_path.stat().st_mode & 0o777)
         os.replace(tmp_file, out_path)
-    except Exception:
-        if tmp_file.exists():
+        replaced = True
+    finally:
+        # Also runs on KeyboardInterrupt, so an interrupted write leaves no temp file.
+        if not replaced and tmp_file.exists():
             tmp_file.unlink()
-        raise
 
 
 def _emit(text: str) -> None:
@@ -832,6 +835,38 @@ class _ArchiveReadError(ValueError):
     """An existing transaction archive could not be parsed for a merge."""
 
 
+def _parse_jsonl_archive(text, path):
+    """Parse a ``.jsonl`` archive: one JSON object per non-blank line."""
+    records = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise _ArchiveReadError(f"{path} has invalid JSON on line {lineno} ({e.msg}).") from e
+        if not isinstance(rec, dict):
+            raise _ArchiveReadError(f"{path} line {lineno} is not a JSON object.")
+        records.append(rec)
+    return records
+
+
+def _parse_json_archive(text, path):
+    """Parse a ``.json`` archive: a list of objects, or a dict holding ``transactions``."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise _ArchiveReadError(f"{path} is not valid JSON (line {e.lineno}: {e.msg}).") from e
+    records = data.get("transactions", []) if isinstance(data, dict) else data
+    if not isinstance(records, list):
+        raise _ArchiveReadError(f"{path} does not contain a list of transactions.")
+    for idx, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            raise _ArchiveReadError(f"{path} transaction entry {idx} is not a JSON object.")
+    return list(records)
+
+
 def _read_existing_transaction_records(path):
     """Load transaction records from an existing ``.jsonl`` or ``.json`` output file.
 
@@ -844,9 +879,8 @@ def _read_existing_transaction_records(path):
         return []
     if expanded.is_symlink():
         raise _ArchiveReadError(f"Refusing to read from symlinked path: {path}")
-    for parent in expanded.parents:
-        if parent.is_symlink():
-            raise _ArchiveReadError(f"Refusing to read from path inside symlinked directory: {path}")
+    if any(parent.is_symlink() for parent in expanded.parents):
+        raise _ArchiveReadError(f"Refusing to read from path inside symlinked directory: {path}")
     p = expanded.resolve()
     try:
         text = p.read_text(encoding="utf-8")
@@ -854,31 +888,8 @@ def _read_existing_transaction_records(path):
         raise _ArchiveReadError(f"{path} is not valid UTF-8 text ({e.reason}).") from e
     if not text.strip():
         return []
-    if str(p).endswith(".jsonl"):
-        records = []
-        for lineno, line in enumerate(text.splitlines(), 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise _ArchiveReadError(f"{path} has invalid JSON on line {lineno} ({e.msg}).") from e
-            if not isinstance(rec, dict):
-                raise _ArchiveReadError(f"{path} line {lineno} is not a JSON object.")
-            records.append(rec)
-        return records
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise _ArchiveReadError(f"{path} is not valid JSON (line {e.lineno}: {e.msg}).") from e
-    records = data.get("transactions", []) if isinstance(data, dict) else data
-    if not isinstance(records, list):
-        raise _ArchiveReadError(f"{path} does not contain a list of transactions.")
-    for idx, rec in enumerate(records):
-        if not isinstance(rec, dict):
-            raise _ArchiveReadError(f"{path} transaction entry {idx} is not a JSON object.")
-    return list(records)
+    parse = _parse_jsonl_archive if str(p).endswith(_JSONL_SUFFIX) else _parse_json_archive
+    return parse(text, path)
 
 
 def _earliest_transaction_date(records):
@@ -901,7 +912,7 @@ def _load_transactions_from_file(args, in_transactions_file, progress_file):
     if not in_t.exists():
         print(f"[!] Transactions file not found: {in_t}", file=sys.stderr)
         raise _CliExit(1)
-    if str(in_t).endswith(".jsonl"):
+    if str(in_t).endswith(_JSONL_SUFFIX):
         transactions_res = _parse_transactions_jsonl(in_t)
     else:
         with open(in_t, "r", encoding="utf-8") as f:
@@ -929,7 +940,7 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
     if args.output_transactions:
         out_path = _safe_output_path(args.output_transactions)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        if str(args.output_transactions).endswith(".jsonl"):
+        if str(args.output_transactions).endswith(_JSONL_SUFFIX):
             def write_body(f):
                 for tx in transactions_res.transactions:
                     f.write(json.dumps(tx, ensure_ascii=False) + "\n")
@@ -947,25 +958,48 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
                 print(f"[+] Transactions CSV saved to: {csv_path}", file=progress_file)
 
 
+def _load_merge_archive(args, start_date, progress_file):
+    """Load the existing archive for ``--merge`` and pick the query start date.
+
+    Returns ``(existing_records, start_date)``. ``existing_records`` is ``None``
+    when merge mode is off. With no explicit ``--start-date`` the earliest
+    archived transaction date is queried forward.
+    """
+    if not (getattr(args, "merge", False) and args.output_transactions):
+        return None, start_date
+    try:
+        existing_records = _read_existing_transaction_records(args.output_transactions)
+    except _ArchiveReadError as e:
+        print(f"[!] Cannot merge: {e} The archive was left unchanged.", file=sys.stderr)
+        raise _CliExit(1)
+    if existing_records and not start_date:
+        earliest = _earliest_transaction_date(existing_records)
+        if earliest:
+            start_date = earliest
+            if not args.quiet:
+                print(f"[*] Merge: querying from earliest archived date {earliest} forward.", file=progress_file)
+    return existing_records, start_date
+
+
+def _merge_into_archive(args, existing_records, transactions_res, progress_file):
+    """Delta-merge the fetched window into the archive, newest-first."""
+    fetched_count = len(transactions_res.transactions)
+    merged = _newest_first(merge_transaction_records(existing_records, transactions_res.transactions))
+    if not args.quiet:
+        print(
+            f"[+] Merge: {fetched_count} fetched transaction(s) merged into "
+            f"{len(existing_records)} archived ({len(merged)} total).",
+            file=progress_file,
+        )
+    return _summarize_transactions(merged, mode=transactions_res.mode)
+
+
 def _fetch_transactions(args, client, progress_file):
-    start_date = args.start_date
     end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Merge mode: load any existing archive up front so the fetched window can be
     # delta-merged into it rather than clobbering multi-year history.
-    existing_records = None
-    if getattr(args, "merge", False) and args.output_transactions:
-        try:
-            existing_records = _read_existing_transaction_records(args.output_transactions)
-        except _ArchiveReadError as e:
-            print(f"[!] Cannot merge: {e} The archive was left unchanged.", file=sys.stderr)
-            raise _CliExit(1)
-        if existing_records and not start_date:
-            earliest = _earliest_transaction_date(existing_records)
-            if earliest:
-                start_date = earliest
-                if not args.quiet:
-                    print(f"[*] Merge: querying from earliest archived date {earliest} forward.", file=progress_file)
+    existing_records, start_date = _load_merge_archive(args, args.start_date, progress_file)
 
     # Beancount reconstruction requires complete transaction history, not truncated.
     # Apply limit only for display purposes (via render functions), not the fetch.
@@ -978,15 +1012,7 @@ def _fetch_transactions(args, client, progress_file):
     )
 
     if existing_records:
-        fetched_count = len(transactions_res.transactions)
-        merged = _newest_first(merge_transaction_records(existing_records, transactions_res.transactions))
-        transactions_res = _summarize_transactions(merged, mode=transactions_res.mode)
-        if not args.quiet:
-            print(
-                f"[+] Merge: {fetched_count} fetched transaction(s) merged into "
-                f"{len(existing_records)} archived ({len(merged)} total).",
-                file=progress_file,
-            )
+        transactions_res = _merge_into_archive(args, existing_records, transactions_res, progress_file)
 
     t_data = transactions_res.to_dict()
     t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
