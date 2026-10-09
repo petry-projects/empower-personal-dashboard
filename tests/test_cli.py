@@ -2,6 +2,8 @@
 test_cli.py — Unit tests for empower CLI.
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -466,8 +468,9 @@ class TestCliMerge(unittest.TestCase):
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_tolerates_null_transaction_date(self, mock_txs):
-        # A record with an explicit null transaction_date must not crash the merge
-        # (previously a date-sort compared None against str keys and raised TypeError).
+        # A record with an explicit null transaction_date must not crash the merge:
+        # the newest-first ordering uses a None-safe key rather than comparing None
+        # against str.
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "transactions.jsonl"
             out.write_text(
@@ -489,8 +492,9 @@ class TestCliMerge(unittest.TestCase):
 
             records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
             ids = [r["user_transaction_id"] for r in records]
-            # Archive order preserved (OLD1, TX2) then new record appended (TX3) — no date-sort reordering.
-            self.assertEqual(ids, ["OLD1", "TX2", "TX3"])
+            # Newest-first with a None-safe key: dated records lead, undated ones
+            # follow in their merged order (archived OLD1, then newly fetched TX3).
+            self.assertEqual(ids, ["TX2", "OLD1", "TX3"])
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_json_output(self, mock_txs):
@@ -566,6 +570,181 @@ class TestCliMerge(unittest.TestCase):
 
             _, kwargs = mock_txs.call_args
             self.assertEqual(kwargs.get("start_date"), "2025-01-01")
+
+
+    def _run_merge(self, out, extra_args=()):
+        argv = [
+            "empower", "--transactions", "--merge",
+            "--output-transactions", str(out),
+            "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+        ] + list(extra_args)
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stderr(stderr):
+            code = cli_main()
+        return code, stderr.getvalue()
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_output_is_newest_first(self, mock_txs):
+        # The fetcher returns newest-first, so a merged archive must stay
+        # newest-first: newly fetched rows lead instead of trailing the archive.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.0}) + "\n"
+                + json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+                {"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.25},
+            ])
+
+            code, _ = self._run_merge(out)
+            self.assertEqual(code, 0)
+
+            records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual([r["user_transaction_id"] for r in records], ["TX3", "TX2", "OLD1"])
+            self.assertEqual(records[1]["amount"], 5.25)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_failed_write_leaves_archive_intact(self, mock_txs):
+        # A serialization error mid-write must not truncate the archive: the
+        # merged output is written to a temp file and only then swapped in.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            original = (
+                json.dumps({"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.0}) + "\n"
+                + json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n"
+            )
+            out.write_text(original, encoding="utf-8")
+            # A set is not JSON-serializable, so writing the updated TX2 fails.
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.25, "tags": {"a", "b"}},
+            ])
+
+            code, _ = self._run_merge(out)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read_text(encoding="utf-8"), original)
+            self.assertEqual(sorted(p.name for p in Path(tmpdir).iterdir()), ["transactions.jsonl"])
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_json_write_is_atomic_on_failure(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.json"
+            original = json.dumps({
+                "start_date": "2020-01-15",
+                "end_date": "2020-01-15",
+                "total_transactions": 1,
+                "transactions": [
+                    {"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0},
+                ],
+            })
+            out.write_text(original, encoding="utf-8")
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0, "tags": {"a"}},
+            ])
+
+            code, _ = self._run_merge(out)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read_text(encoding="utf-8"), original)
+            self.assertEqual(sorted(p.name for p in Path(tmpdir).iterdir()), ["transactions.json"])
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_preserves_existing_file_mode(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(out, 0o640)
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+            ])
+
+            code, _ = self._run_merge(out)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(out.stat().st_mode & 0o777, 0o640)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_refuses_corrupt_jsonl_archive(self, mock_txs):
+        # A malformed line must stop the merge before anything is fetched or
+        # written; skipping it would silently drop history on the rewrite.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            original = (
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n"
+                + '{"user_transaction_id": "TX2", "transaction_da\n'
+            )
+            out.write_text(original, encoding="utf-8")
+            mock_txs.return_value = self._mk_result([])
+
+            code, err = self._run_merge(out)
+
+            self.assertEqual(code, 1)
+            self.assertIn("line 2", err)
+            self.assertIn("left unchanged", err)
+            self.assertNotIn("Unexpected error", err)
+            mock_txs.assert_not_called()
+            self.assertEqual(out.read_text(encoding="utf-8"), original)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_refuses_invalid_json_archive(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.json"
+            original = '{"transactions": [{"user_transaction_id": "OLD1"'
+            out.write_text(original, encoding="utf-8")
+            mock_txs.return_value = self._mk_result([])
+
+            code, err = self._run_merge(out)
+
+            self.assertEqual(code, 1)
+            self.assertIn("left unchanged", err)
+            self.assertNotIn("Unexpected error", err)
+            mock_txs.assert_not_called()
+            self.assertEqual(out.read_text(encoding="utf-8"), original)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_refuses_non_object_archive_entries(self, mock_txs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.json"
+            original = json.dumps([{"user_transaction_id": "OLD1", "transaction_date": "2020-01-15"}, 42])
+            out.write_text(original, encoding="utf-8")
+            mock_txs.return_value = self._mk_result([])
+
+            code, err = self._run_merge(out)
+
+            self.assertEqual(code, 1)
+            self.assertIn("left unchanged", err)
+            mock_txs.assert_not_called()
+            self.assertEqual(out.read_text(encoding="utf-8"), original)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_applies_to_default_output_path(self, mock_txs):
+        # --output-transactions has a default, so --merge without it is not a
+        # no-op: it merges into the default archive.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_out = Path(tmpdir) / "empower_transactions.jsonl"
+            default_out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2020-01-15", "description": "Old", "amount": 10.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+            ])
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch("empower_personal_dashboard.cli.DEFAULT_TRANSACTIONS_FILE", default_out), \
+                    patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            records = [json.loads(line) for line in default_out.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual([r["user_transaction_id"] for r in records], ["TX3", "OLD1"])
 
 
 class TestSafeOutputPath(unittest.TestCase):
