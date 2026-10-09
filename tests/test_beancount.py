@@ -347,10 +347,11 @@ class TestBeancountGenerator(unittest.TestCase):
         self.assertIn("2026-10-01 balance Assets:AllyBank:EverydayChecking 5000.00 USD", output)
         # Credit liability balance is asserted as negative in Beancount
         self.assertIn("2026-10-01 balance Liabilities:Chase:SapphireReserve -2000.00 USD", output)
-        # Commodity balance assertions are dated the day after the snapshot so
-        # Beancount's beginning-of-day evaluation counts any same-day trades.
-        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
-        self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
+        # Commodity balance assertions are dated two days after the snapshot:
+        # +1 day to count same-day trades, +1 more day to allow deficit-floor
+        # shortfall reconciliations to post before the balance check.
+        self.assertIn("2026-10-03 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
+        self.assertIn("2026-10-03 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
 
     def test_generate_prices_bean(self):
         output = self.generator.generate_prices_bean(self.synthetic_holdings)
@@ -1363,8 +1364,8 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             holdings=self.holdings_snapshot,
             transactions=self.transactions_history,
         )
-        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
-        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
+        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
+        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 15.000000 AAPL", bal_output)
 
     def test_modular_ledger_export_lifecycle_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

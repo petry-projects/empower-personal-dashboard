@@ -1071,10 +1071,12 @@ class BeancountGenerator:
         # Beancount evaluates balance directives at the beginning of the day,
         # so a trade dated on as_of has not yet posted when an assertion dated
         # as_of is checked. Asserting the snapshot on the following day counts
-        # all same-day activity and keeps the reconstructed inventory exact.
+        # all same-day activity. Since deficit-floor shortfall reconciliations
+        # also post on the following day, move the assertion one more day forward
+        # to ensure the shortfall is applied before checking the balance.
         try:
             assert_date = (
-                datetime.date.fromisoformat(as_of) + datetime.timedelta(days=1)
+                datetime.date.fromisoformat(as_of) + datetime.timedelta(days=2)
             ).isoformat()
         except Exception:
             assert_date = as_of
@@ -1483,7 +1485,7 @@ class BeancountGenerator:
             if round(floor_surplus, 6) > 0 and snapshot_date:
                 self._append_shortfall_reconciliation(
                     lines, snapshot_date, pos.get("firm", _FIRM_BROKERAGE), ticker,
-                    holding_tag, b_account, floor_surplus,
+                    holding_tag, b_account, floor_surplus, pos.get("price", 0.0),
                 )
 
     def _append_shortfall_reconciliation(
@@ -1495,6 +1497,7 @@ class BeancountGenerator:
         holding_tag: str,
         b_account: str,
         surplus: float,
+        price: float = 0.0,
     ) -> None:
         """Dispose a deficit-floor surplus on the snapshot date to match the assertion.
 
@@ -1504,7 +1507,8 @@ class BeancountGenerator:
         exact timing is unknowable (same-day sell/buy ordering), so the surplus is
         reconciled explicitly against ``Equity:Opening-Balances`` on the day after
         the snapshot — after same-day activity — rather than silently breaking
-        the ledger. The ``{}`` reduction books FIFO against the floored opening lot.
+        the ledger. The reduction is booked at the snapshot price so the equity
+        posting balances correctly.
         """
         payee_esc = _escape_beancount_string(f"{firm} Snapshot Shortfall Reconciliation")
         narration_esc = _escape_beancount_string(f"{ticker} Deficit Floor Adjustment")
@@ -1517,10 +1521,17 @@ class BeancountGenerator:
             pass
         lines.append(f'{reconciliation_date} * "{payee_esc}" "{narration_esc}"\n')
         lines.append(f'  empower_holding: "{holding_tag}"\n')
-        lines.append(
-            f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}\n"
-        )
-        lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
+        equity_amount = round(surplus * price, 2) if price > 0 else 0.0
+        if equity_amount > 0:
+            lines.append(
+                f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} @ {_format_price(price)} USD\n"
+            )
+            lines.append(f"  {ACCT_OPENING_BALANCES:<36} {equity_amount:>8.2f} USD\n\n")
+        else:
+            lines.append(
+                f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}\n"
+            )
+            lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
 
     def _append_snapshot_lot(
         self,
