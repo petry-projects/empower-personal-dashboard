@@ -1394,6 +1394,95 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             self.assertIn("open Income:CapitalGains", accounts_bean)
             self.assertIn("open Income:Dividends USD", accounts_bean)
 
+    def test_rejected_backward_append_leaves_ledger_unmodified(self):
+        """A backward-broadening append must abort before rewriting any file.
+
+        The window guard is pre-flighted in ``export_modular_ledger`` ahead of
+        every write, so a rejected append leaves main.bean / accounts.bean /
+        balances.bean byte-for-byte unchanged instead of partially updated.
+        """
+        from empower_personal_dashboard.exceptions import LedgerAppendError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dest = Path(tmp_dir) / "ledger"
+            self.generator.export_modular_ledger(
+                destination_dir=dest,
+                balances=self.balances,
+                holdings=self.holdings_snapshot,
+                transactions=self.transactions_history,
+                opening_date="2020-01-01",
+            )
+            before = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted(dest.glob("*.bean"))
+            }
+            # A second account the first export never saw: if any write runs
+            # before the guard fires, accounts.bean/balances.bean would gain this
+            # account, making a partial update observable.
+            mutated_balances = DashboardBalances(
+                as_of_date="2024-10-01",
+                net_worth=26000.0,
+                total_cash=5000.0,
+                total_investment=21000.0,
+                total_card_liabilities=0.0,
+                total_loan=0.0,
+                total_mortgage=0.0,
+                accounts=[
+                    self.balances.accounts[0],
+                    {
+                        "account_id": "ACC-CASH-999",
+                        "account_name": "New Cash Reserve",
+                        "firm_name": "Zenith Bank",
+                        "account_type": "cash",
+                        "balance": 5000.0,
+                        "is_asset": True,
+                        "currency": "USD",
+                        "user_account_id": 5099,
+                    },
+                ],
+            )
+            # Opening the lot in 2018 broadens the persisted 2020 window into the
+            # past, which the guard rejects.
+            backward_txns = DashboardTransactions(
+                start_date="2018-01-01",
+                end_date="2024-10-01",
+                total_transactions=1,
+                money_in=0.0,
+                money_out=4000.0,
+                net_cashflow=-4000.0,
+                transactions=[
+                    {
+                        "user_transaction_id": "tx-2018",
+                        "account_id": "ACC-BRK-001",
+                        "user_account_id": 5001,
+                        "account_name": "Taxable Brokerage",
+                        "firm_name": "Acme Brokerage",
+                        "transaction_date": "2018-06-15",
+                        "description": "Buy VTI",
+                        "amount": 4000.0,
+                        "is_cash_out": True,
+                        "transaction_type": "Buy",
+                        "investment_type": "Buy",
+                        "symbol": "VTI",
+                        "price": 200.0,
+                        "quantity": 20.0,
+                    },
+                ],
+            )
+            with self.assertRaises(LedgerAppendError):
+                self.generator.export_modular_ledger(
+                    destination_dir=dest,
+                    balances=mutated_balances,
+                    holdings=self.holdings_snapshot,
+                    transactions=backward_txns,
+                    opening_date="2018-01-01",
+                )
+            after = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted(dest.glob("*.bean"))
+            }
+            self.assertEqual(before, after)
+
     def test_single_file_export_lifecycle_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             target = Path(tmp_dir) / "full_ledger.bean"

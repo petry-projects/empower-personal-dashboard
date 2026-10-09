@@ -1963,6 +1963,15 @@ class BeancountGenerator:
         dest.mkdir(parents=True, exist_ok=True)
         effective_opening_date = _determine_opening_date(transactions, balances, opening_date)
 
+        # Pre-flight the backward-broadening guard *before* any file is written.
+        # The guard otherwise fires inside ``_write_modular_holdings``, i.e. after
+        # main.bean / accounts.bean / balances.bean have already been overwritten,
+        # which would leave the existing ledger partially updated on a rejected
+        # append. Validating up front makes the export all-or-nothing.
+        self._preflight_modular_append_guard(
+            dest, append, holdings, balances, transactions, effective_opening_date,
+        )
+
         created_files: List[Path] = [
             self._write_modular_main(dest, append),
             self._write_modular_section(
@@ -1982,6 +1991,35 @@ class BeancountGenerator:
             self._write_modular_transactions(dest, append, transactions, balances),
         ]
         return created_files
+
+    def _preflight_modular_append_guard(
+        self,
+        dest: Path,
+        append: bool,
+        holdings: Optional[DashboardHoldings],
+        balances: Optional[DashboardBalances],
+        transactions: Optional[DashboardTransactions],
+        effective_opening_date: Optional[str],
+    ) -> None:
+        """Reject a backward-broadening append before any modular file is touched.
+
+        Mirrors the ``existing_content``/``lot_date`` resolution that
+        ``_write_modular_holdings`` would perform, then runs
+        :meth:`_guard_window_not_broadened`. Running it here — ahead of every
+        write in :meth:`export_modular_ledger` — guarantees a rejected append
+        raises :class:`LedgerAppendError` without having partially rewritten
+        main.bean / accounts.bean / balances.bean. The guard re-runs harmlessly
+        (idempotently) inside ``generate_holdings_bean`` later on.
+        """
+        holdings_path = dest / "holdings.bean"
+        if not (append and holdings_path.exists()):
+            return
+        _verify_not_symlink(holdings_path)
+        existing_h_text = holdings_path.read_text(encoding="utf-8")
+        lot_date = self._resolve_lot_date(
+            holdings, effective_opening_date, transactions, balances,
+        )
+        self._guard_window_not_broadened(existing_h_text, lot_date)
 
     def _write_modular_section(self, dest: Path, filename: str, content: str) -> Path:
         """Write a freshly generated modular component file (always overwritten)."""
