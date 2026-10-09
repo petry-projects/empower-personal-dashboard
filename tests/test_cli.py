@@ -465,6 +465,34 @@ class TestCliMerge(unittest.TestCase):
             self.assertEqual(len(records), 3)
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_tolerates_null_transaction_date(self, mock_txs):
+        # A record with an explicit null transaction_date must not crash the merge
+        # (previously a date-sort compared None against str keys and raised TypeError).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "OLD1", "transaction_date": None, "description": "No date", "amount": 10.0}) + "\n"
+                + json.dumps({"user_transaction_id": "TX2", "transaction_date": "2026-09-01", "description": "Coffee", "amount": 5.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([
+                {"user_transaction_id": "TX3", "transaction_date": None, "description": "New no date", "amount": 7.0},
+            ])
+
+            argv = [
+                "empower", "--transactions", "--merge",
+                "--output-transactions", str(out),
+                "--quiet", "--session-file", "/nonexistent/session.json", "--mock",
+            ]
+            with patch.object(sys, "argv", argv):
+                self.assertEqual(cli_main(), 0)
+
+            records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+            ids = [r["user_transaction_id"] for r in records]
+            # Archive order preserved (OLD1, TX2) then new record appended (TX3) — no date-sort reordering.
+            self.assertEqual(ids, ["OLD1", "TX2", "TX3"])
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_json_output(self, mock_txs):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "transactions.json"

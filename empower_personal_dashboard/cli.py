@@ -914,7 +914,6 @@ def _fetch_transactions(args, client, progress_file):
     if existing_records:
         fetched_count = len(transactions_res.transactions)
         merged = merge_transaction_records(existing_records, transactions_res.transactions)
-        merged.sort(key=lambda t: t.get("transaction_date", ""), reverse=True)
         transactions_res = _summarize_transactions(merged, mode=transactions_res.mode)
         if not args.quiet:
             print(
