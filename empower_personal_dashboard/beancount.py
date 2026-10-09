@@ -1199,7 +1199,8 @@ class BeancountGenerator:
         """
         if not existing_content:
             return
-        m = re.search(rf"{_WINDOW_START_MARKER}:\s*(\S+)", existing_content)
+        pattern = re.escape(_WINDOW_START_MARKER) + r":\s*(\S+)"
+        m = re.search(pattern, existing_content)
         if m:
             prior_start = m.group(1).strip()
         else:
@@ -1255,7 +1256,7 @@ class BeancountGenerator:
         lines = [
             ";; ==============================================================================\n"
             ";; Empower Personal Dashboard - Portfolio Holdings & Lots\n"
-            f";; {_WINDOW_START_MARKER}: {lot_date}\n"
+            ";; " + _WINDOW_START_MARKER + ": " + lot_date + "\n"
             ";; ==============================================================================\n\n"
         ]
 
