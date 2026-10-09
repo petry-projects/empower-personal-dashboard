@@ -957,8 +957,61 @@ class TestReconstructionWindowGuard(unittest.TestCase):
             money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
         )
         client = self._client()
-        result = client.reconcile_transaction_window(transactions, holdings)
+        with patch.object(client.logger, "warning") as warn:
+            result = client.reconcile_transaction_window(transactions, holdings)
         self.assertIs(result, transactions)
+        warn.assert_not_called()
+
+    def test_unknown_policy_raises_value_error(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        with self.assertRaises(ValueError):
+            client.reconcile_transaction_window(transactions, holdings, policy="erorr")
+
+    def test_extend_rejects_window_still_short_of_snapshot(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings, transactions = self._incomplete()
+        client = self._client()
+
+        def fake_fetch(**kwargs):
+            # Refetch still returns a window that ends before the snapshot date.
+            return DashboardTransactions(
+                start_date=kwargs.get("start_date") or "2024-01-01",
+                end_date="2024-07-31", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            with self.assertRaises(ReconstructionWindowError):
+                client.reconcile_transaction_window(
+                    transactions, holdings, policy="extend",
+                )
+
+    def test_extend_drops_limit_and_date_kwargs(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        captured = {}
+
+        def fake_fetch(**kwargs):
+            captured.update(kwargs)
+            return DashboardTransactions(
+                start_date=kwargs.get("start_date") or "2024-01-01",
+                end_date=kwargs.get("end_date") or "", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            client.reconcile_transaction_window(
+                transactions, holdings, policy="extend",
+                limit=10, start_date="1999-01-01", end_date="1999-12-31",
+                user_account_ids="5001",
+            )
+        # limit/start_date/end_date must not leak through (limit truncates; the
+        # dates would collide with the explicit keywords). user_account_ids does.
+        self.assertNotIn("limit", captured)
+        self.assertEqual(captured.get("start_date"), "2024-01-01")
+        self.assertEqual(captured.get("end_date"), "2024-10-01")
+        self.assertEqual(captured.get("user_account_ids"), "5001")
 
 
 if __name__ == "__main__":

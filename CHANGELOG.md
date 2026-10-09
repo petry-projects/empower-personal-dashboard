@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Emitted an explicit shortfall reconciliation when the intra-window running-deficit floor over-provisions an opening lot, so the reconstructed final quantity still matches the asserted snapshot.
   - Persisted the exported window-start boundary in `holdings.bean` and reject (`LedgerAppendError`) an append that broadens the window into the past, which would leave the already-exported opening lot stale.
   - Added `EmpowerDashboardClient.reconcile_transaction_window(...)` guard for an incomplete transaction window (ends before `holdings.as_of_date`) with a `warn` / `error` / `extend` contract, raising `ReconstructionWindowError` under the `error` policy.
-  - Added a real Beancount loader (`beancount>=3.0`, test extra only) to the test suite so generated ledgers are validated by `beancount.loader.load_string`, not string matching.
+  - Added a real Beancount loader (`beancount>=3.0`, included in the `test`, `dev`, and `all` extras and gated to Python >= 3.10; never a runtime dependency) to the test suite so generated ledgers are validated by `beancount.loader.load_string`, not string matching. The loader tests skip on Python 3.9, where the dependency is unavailable.
 
 ## [0.3.0] - 2026-10-10
 

@@ -882,9 +882,15 @@ class EmpowerDashboardClient:
           - ``"error"``: raise :class:`ReconstructionWindowError`.
           - ``"extend"``: re-fetch transactions through ``holdings.as_of_date`` and
             return the widened container. Any ``fetch_kwargs`` (e.g.
-            ``user_account_ids``) are forwarded to :meth:`fetch_transactions`.
+            ``user_account_ids``) are forwarded to :meth:`fetch_transactions`,
+            except ``start_date``/``end_date`` (driven by this method) and
+            ``limit`` (would truncate the widened range and silently drop older
+            trades) which are ignored. If the refetched window still ends before
+            the snapshot date, :class:`ReconstructionWindowError` is raised rather
+            than handing an incomplete window to reconstruction.
 
-        A window that already reaches the snapshot date is returned unchanged.
+        An unknown ``policy`` raises :class:`ValueError`. A window that already
+        reaches the snapshot date is returned unchanged.
         """
         if self._window_covers_snapshot(transactions.end_date, holdings.as_of_date):
             return transactions
@@ -895,6 +901,10 @@ class EmpowerDashboardClient:
             f"absorb omitted post-range trades"
         )
         normalized_policy = (policy or "warn").strip().lower()
+        if normalized_policy not in {"warn", "error", "extend"}:
+            raise ValueError(
+                f"policy must be 'warn', 'error', or 'extend', not {policy!r}"
+            )
         if normalized_policy == "error":
             raise ReconstructionWindowError(detail)
         if normalized_policy == "extend":
@@ -903,11 +913,28 @@ class EmpowerDashboardClient:
                 self.logger.warning("Cannot extend reconstruction window: %s", detail)
                 return transactions
             self.logger.warning("Extending reconstruction window to %s: %s", as_of, detail)
-            return self.fetch_transactions(
+            # The date range is driven entirely by this method, so drop any
+            # caller-supplied ``start_date``/``end_date`` (they would collide with
+            # the explicit keywords below and raise a duplicate-keyword TypeError)
+            # and ``limit`` (it truncates the widened range to the newest N trades,
+            # so the returned window could reach the snapshot while silently
+            # dropping older trades reconstruction depends on).
+            extend_kwargs = {
+                key: value
+                for key, value in fetch_kwargs.items()
+                if key not in {"start_date", "end_date", "limit"}
+            }
+            extended = self.fetch_transactions(
                 start_date=transactions.start_date or None,
                 end_date=as_of,
-                **fetch_kwargs,
+                **extend_kwargs,
             )
+            if not self._window_covers_snapshot(extended.end_date, as_of):
+                raise ReconstructionWindowError(
+                    f"extended transaction window still ends "
+                    f"{extended.end_date!r} before holdings as_of_date {as_of!r}"
+                )
+            return extended
         # Default: warn and leave the caller's data untouched.
         self.logger.warning("Incomplete reconstruction window: %s", detail)
         return transactions

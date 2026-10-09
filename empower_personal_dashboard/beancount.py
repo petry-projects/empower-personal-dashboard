@@ -1134,13 +1134,36 @@ class BeancountGenerator:
         lot dated before that boundary would broaden the window into the past, but
         the already-exported opening lot is never revised — so the historical
         inventory would be inconsistent. Such an append is rejected.
+
+        The marker lives in the header, which ``_strip_bean_header`` removes from
+        every appended body, so a ``holdings.bean`` first written by an older
+        release (or by a prior append) never carries it. When it is absent we fall
+        back to the earliest existing opening-lot date (directives posting to
+        ``Equity:Opening-Balances``), so the guard still rejects a
+        backward-broadening append instead of silently permitting it.
         """
         if not existing_content:
             return
         m = re.search(rf"{_WINDOW_START_MARKER}:\s*(\S+)", existing_content)
-        if not m:
-            return
-        prior_start = m.group(1).strip()
+        if m:
+            prior_start = m.group(1).strip()
+        else:
+            # No marker (legacy file, or a body stripped of its header): derive the
+            # earliest existing *opening-lot* date instead. Only directives that
+            # post to ``Equity:Opening-Balances`` are reconstructed opening lots, so
+            # restricting to those avoids mistaking a later snapshot/price directive
+            # for the window boundary.
+            opening_dates = [
+                block_match.group(1)
+                for block in re.split(r"\n\s*\n", existing_content)
+                if ACCT_OPENING_BALANCES in block
+                for block_match in [re.match(r"\s*(\d{4}-\d{2}-\d{2})\b", block)]
+                if block_match
+            ]
+            if not opening_dates:
+                return
+            # ISO ``YYYY-MM-DD`` dates compare chronologically under a lexical compare.
+            prior_start = min(opening_dates)
         # ISO ``YYYY-MM-DD`` dates compare chronologically under a lexical compare.
         if lot_date and prior_start and lot_date < prior_start:
             raise LedgerAppendError(

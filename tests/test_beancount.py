@@ -2031,6 +2031,28 @@ class TestOpeningDateClamp(unittest.TestCase):
             self.assertIn('include "broken_bow.bean"', content)
 
 
+class TestWindowStartGuardFallback(unittest.TestCase):
+    """The backward-broadening guard must still fire on a marker-less holdings file."""
+
+    def test_markerless_existing_content_uses_earliest_lot_date(self):
+        from empower_personal_dashboard.exceptions import LedgerAppendError
+        # A holdings.bean body written by an older release (or any append, whose
+        # stripped body drops the header marker) carries no window-start marker.
+        markerless = (
+            '2022-06-15 * "Acme Brokerage Portfolio Snapshot" "VTI Position"\n'
+            '  empower_holding: "Assets:AcmeBrokerage:Taxable:VTI"\n'
+            "  Assets:AcmeBrokerage:Taxable  20.000000 VTI @ 200.0000 USD\n"
+            "  Equity:Opening-Balances\n\n"
+        )
+        # An append whose opening lot predates the earliest existing dated
+        # directive broadens the window into the past and must be rejected.
+        with self.assertRaises(LedgerAppendError):
+            BeancountGenerator._guard_window_not_broadened(markerless, "2020-01-01")
+        # An append on/after the earliest existing date is permitted.
+        BeancountGenerator._guard_window_not_broadened(markerless, "2022-06-15")
+        BeancountGenerator._guard_window_not_broadened(markerless, "2023-01-01")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -12,7 +12,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from beancount import loader
+try:
+    from beancount import loader
+    _HAS_BEANCOUNT = True
+except ImportError:  # pragma: no cover - exercised on Python 3.9 CI leg
+    # ``beancount>=3.0`` is gated to Python >= 3.10 in the test extra (its early
+    # 3.0.x releases dropped 3.9), so on 3.9 the real loader is unavailable and
+    # these validation tests are skipped rather than erroring at import time.
+    loader = None
+    _HAS_BEANCOUNT = False
 
 from empower_personal_dashboard.beancount import BeancountGenerator
 from empower_personal_dashboard.exceptions import LedgerAppendError
@@ -56,6 +64,7 @@ def _brokerage_balances(as_of="2024-10-01", balance=20100.0):
     )
 
 
+@unittest.skipUnless(_HAS_BEANCOUNT, "requires beancount>=3.0 (Python >= 3.10)")
 class TestLedgerLoadRegression(unittest.TestCase):
     """The pre-existing lifecycle ledger must still load clean (loader harness sanity)."""
 
@@ -94,6 +103,7 @@ class TestLedgerLoadRegression(unittest.TestCase):
             assert_ledger_loads(self, target.read_text(encoding="utf-8"))
 
 
+@unittest.skipUnless(_HAS_BEANCOUNT, "requires beancount>=3.0 (Python >= 3.10)")
 class TestShortPositions(unittest.TestCase):
     """Item 1 — negative snapshot quantities preserved end to end."""
 
@@ -168,6 +178,7 @@ class TestShortPositions(unittest.TestCase):
             assert_ledger_loads(self, target.read_text(encoding="utf-8"))
 
 
+@unittest.skipUnless(_HAS_BEANCOUNT, "requires beancount>=3.0 (Python >= 3.10)")
 class TestDeficitFloorShortfall(unittest.TestCase):
     """Item 4 — a deficit-floored opening lot must still match the asserted snapshot."""
 
@@ -215,6 +226,7 @@ class TestDeficitFloorShortfall(unittest.TestCase):
         assert_ledger_loads(self, content)
 
 
+@unittest.skipUnless(_HAS_BEANCOUNT, "requires beancount>=3.0 (Python >= 3.10)")
 class TestBackwardAppend(unittest.TestCase):
     """Item 3 — an append that broadens the window into the past is rejected."""
 
