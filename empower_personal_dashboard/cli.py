@@ -22,12 +22,14 @@ Usage:
 """
 
 import argparse
+import contextlib
 import csv
 import getpass
 import json
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -52,6 +54,7 @@ DEFAULT_OUTPUT_DIR = Path.cwd() / "data"
 DEFAULT_BALANCES_FILE = DEFAULT_OUTPUT_DIR / "empower_balances.json"
 DEFAULT_HOLDINGS_FILE = DEFAULT_OUTPUT_DIR / "empower_holdings.json"
 DEFAULT_TRANSACTIONS_FILE = DEFAULT_OUTPUT_DIR / "empower_transactions.jsonl"
+_JSONL_SUFFIX = ".jsonl"
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +162,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to YAML/JSON Beancount account/category mapping configuration.",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help=(
+            "Merge freshly fetched transactions into an existing --output-transactions "
+            "file by user_transaction_id: matching records are updated in place, new "
+            "records appended, and older historical records (outside the queried window) "
+            "preserved. When --start-date is omitted and the file exists, the earliest "
+            "archived transaction date is auto-detected and queried forward."
+        ),
     )
     parser.add_argument(
         "--overwrite-ledger",
@@ -649,6 +663,38 @@ def _safe_output_path(path: Path) -> Path:
     return expanded.resolve()
 
 
+def _atomic_write(out_path: Path, write_body) -> None:
+    """Write ``out_path`` through a sibling temp file and an atomic ``os.replace``.
+
+    ``write_body`` receives the open text handle. A crash, full disk or
+    serialization error part-way through leaves the previous file untouched
+    instead of truncated — which matters most for a merged multi-year archive.
+
+    The temp file is created with an exclusive ``open``, so the OS applies the
+    process umask exactly as it would for a direct write: a new file gets the
+    umask default without the umask ever being read or changed. An existing
+    file keeps its owner permission bits only, applied to the still-empty
+    temp file before any content is written, so an owner-only archive is never
+    staged in a more widely readable file.
+    """
+    existing_mode = out_path.stat().st_mode & 0o700 if out_path.exists() else None
+    tmp_file = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    replaced = False
+    try:
+        with open(tmp_file, "x", encoding="utf-8") as f:
+            if existing_mode is not None:
+                os.chmod(tmp_file, existing_mode)
+            write_body(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_file, out_path)
+        replaced = True
+    finally:
+        # Also runs on KeyboardInterrupt, so an interrupted write leaves no temp file.
+        if not replaced and tmp_file.exists():
+            tmp_file.unlink()
+
+
 def _emit(text: str) -> None:
     """Write rendered user-requested report output to stdout.
 
@@ -728,13 +774,8 @@ def _load_holdings(args, client, in_holdings_file, progress_file):
     return holdings_res
 
 
-def _parse_transactions_jsonl(in_t):
-    tx_list = []
-    with open(in_t, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                tx_list.append(json.loads(line))
+def _summarize_transactions(tx_list, mode="historical"):
+    """Build a DashboardTransactions summary (date span + cashflow) over a list of records."""
     dates = [t.get("transaction_date") for t in tx_list if t.get("transaction_date")]
     s_date = min(dates) if dates else "2026-01-01"
     e_date = max(dates) if dates else "2026-12-31"
@@ -748,8 +789,166 @@ def _parse_transactions_jsonl(in_t):
         money_out=round(m_out, 2),
         net_cashflow=round(m_in - m_out, 2),
         transactions=tx_list,
-        mode="historical",
+        mode=mode,
     )
+
+
+def _parse_transactions_jsonl(in_t):
+    tx_list = []
+    with open(in_t, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                tx_list.append(json.loads(line))
+    return _summarize_transactions(tx_list)
+
+
+def merge_transaction_records(existing, incoming):
+    """Merge ``incoming`` transaction records into ``existing`` by ``user_transaction_id``.
+
+    - Records whose ``user_transaction_id`` matches an existing record are updated in
+      place with the incoming version (e.g. ``status`` revised from ``pending`` to
+      ``posted``, revised amounts or dates), preserving the original position so the
+      archive's historical ordering stays stable.
+    - Records carrying a new ``user_transaction_id`` are appended.
+    - Existing records absent from ``incoming`` — older historical transactions outside
+      the queried window — are preserved untouched.
+
+    Records lacking a ``user_transaction_id`` cannot be keyed, so they are preserved as-is
+    (existing ones kept, incoming ones appended). An incoming one that is identical to a
+    record already present is not appended again, so re-fetching the same window on every
+    run does not pile up copies.
+    """
+    merged = []
+    index = {}  # user_transaction_id -> position in merged
+    unkeyed = set()  # canonical form of every record that has no id
+    for rec in existing:
+        tid = rec.get("user_transaction_id")
+        if tid:
+            index[str(tid)] = len(merged)
+        else:
+            unkeyed.add(_canonical_record(rec))
+        merged.append(dict(rec))
+    for rec in incoming:
+        tid = rec.get("user_transaction_id")
+        if tid and str(tid) in index:
+            merged[index[str(tid)]] = dict(rec)
+            continue
+        if tid:
+            index[str(tid)] = len(merged)
+        else:
+            canonical = _canonical_record(rec)
+            if canonical in unkeyed:
+                continue
+            unkeyed.add(canonical)
+        merged.append(dict(rec))
+    return merged
+
+
+def _canonical_record(rec):
+    """Order-independent text form of a record, for comparing records that have no id."""
+    return json.dumps(rec, sort_keys=True, default=str, ensure_ascii=False)
+
+
+class _ArchiveReadError(ValueError):
+    """An existing transaction archive could not be parsed for a merge."""
+
+
+def _parse_jsonl_archive(text, path):
+    """Parse a ``.jsonl`` archive: one JSON object per non-blank line.
+
+    Lines are split on LF only. ``str.splitlines`` would also break on U+2028,
+    U+2029 and other separators that are legal inside a JSON string and that the
+    writer emits raw (``ensure_ascii=False``).
+    """
+    records = []
+    for lineno, line in enumerate(text.split("\n"), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise _ArchiveReadError(f"{path} has invalid JSON on line {lineno} ({e.msg}).") from e
+        if not isinstance(rec, dict):
+            raise _ArchiveReadError(f"{path} line {lineno} is not a JSON object.")
+        records.append(rec)
+    return records
+
+
+def _parse_json_archive(text, path):
+    """Parse a ``.json`` archive: a list of objects, or a dict holding ``transactions``."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise _ArchiveReadError(f"{path} is not valid JSON (line {e.lineno}: {e.msg}).") from e
+    # A dict must carry the list under "transactions". Reading a dict without it
+    # as an empty archive would let the merge overwrite a file this tool did not
+    # write with only the fetched window.
+    records = data.get("transactions") if isinstance(data, dict) else data
+    if not isinstance(records, list):
+        raise _ArchiveReadError(f"{path} does not contain a list of transactions.")
+    for idx, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            raise _ArchiveReadError(f"{path} transaction entry {idx} is not a JSON object.")
+    return list(records)
+
+
+def _read_existing_transaction_records(path):
+    """Load transaction records from an existing ``.jsonl`` or ``.json`` output file.
+
+    Raises ``_ArchiveReadError`` when the file is not a readable archive of JSON
+    objects. A malformed entry is never skipped: the merge rewrites the whole
+    file, so dropping a record here would silently delete history.
+    """
+    expanded = Path(os.path.expanduser(str(path)))
+    if not expanded.exists():
+        return []
+    if expanded.is_symlink():
+        raise _ArchiveReadError(f"Refusing to read from symlinked path: {path}")
+    if any(parent.is_symlink() for parent in expanded.parents):
+        raise _ArchiveReadError(f"Refusing to read from path inside symlinked directory: {path}")
+    p = expanded.resolve()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise _ArchiveReadError(f"{path} is not valid UTF-8 text ({e.reason}).") from e
+    if not text.strip():
+        return []
+    parse = _parse_jsonl_archive if str(p).endswith(_JSONL_SUFFIX) else _parse_json_archive
+    return parse(text, path)
+
+
+def _earliest_transaction_date(records):
+    """Return the earliest canonical ``YYYY-MM-DD`` ``transaction_date``, or None.
+
+    Only strings that parse as a canonical ISO ``YYYY-MM-DD`` date are
+    considered. Missing, null, non-string, and malformed values are skipped so a
+    bad archive entry can never become the selected minimum and get forwarded as
+    an invalid ``start_date`` (``startDate``) to ``client.fetch_transactions``,
+    which would violate the CLI's ``YYYY-MM-DD`` date contract.
+    """
+    dates = []
+    for record in records:
+        value = record.get("transaction_date")
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if parsed.strftime("%Y-%m-%d") == value:
+            dates.append(value)
+    return min(dates) if dates else None
+
+
+def _newest_first(records):
+    """Order records newest-first by ``transaction_date``, as the fetcher returns them.
+
+    The key is None-safe, so undated records sort last instead of raising. The
+    sort is stable: records sharing a date keep their merged order.
+    """
+    return sorted(records, key=lambda r: str(r.get("transaction_date") or ""), reverse=True)
 
 
 def _load_transactions_from_file(args, in_transactions_file, progress_file):
@@ -757,7 +956,7 @@ def _load_transactions_from_file(args, in_transactions_file, progress_file):
     if not in_t.exists():
         print(f"[!] Transactions file not found: {in_t}", file=sys.stderr)
         raise _CliExit(1)
-    if str(in_t).endswith(".jsonl"):
+    if str(in_t).endswith(_JSONL_SUFFIX):
         transactions_res = _parse_transactions_jsonl(in_t)
     else:
         with open(in_t, "r", encoding="utf-8") as f:
@@ -785,13 +984,14 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
     if args.output_transactions:
         out_path = _safe_output_path(args.output_transactions)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        if str(args.output_transactions).endswith(".jsonl"):
-            with open(out_path, "w", encoding="utf-8") as f:
+        if str(args.output_transactions).endswith(_JSONL_SUFFIX):
+            def write_body(f):
                 for tx in transactions_res.transactions:
                     f.write(json.dumps(tx, ensure_ascii=False) + "\n")
         else:
-            with open(out_path, "w", encoding="utf-8") as f:
+            def write_body(f):
                 json.dump(t_data, f, indent=2, ensure_ascii=False)
+        _atomic_write(out_path, write_body)
         if not args.quiet:
             print(f"[+] Transactions saved to: {args.output_transactions}", file=progress_file)
 
@@ -802,22 +1002,137 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
                 print(f"[+] Transactions CSV saved to: {csv_path}", file=progress_file)
 
 
-def _fetch_transactions(args, client, progress_file):
-    start_date = args.start_date
-    end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    # Beancount reconstruction requires complete transaction history, not truncated.
-    # Apply limit only for display purposes (via render functions), not the fetch.
-    tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
-    transactions_res = client.fetch_transactions(
-        start_date=start_date,
-        end_date=end_date,
-        user_account_ids=args.account_id,
-        limit=tx_limit,
-    )
-    t_data = transactions_res.to_dict()
-    t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
+@contextlib.contextmanager
+def _archive_lock(path):
+    """Hold an exclusive advisory lock for a transaction archive.
 
-    _write_transactions_output(args, transactions_res, t_data, progress_file)
+    The ``--merge`` flow reads the archive, fetches a window, merges, then
+    atomically replaces the file. ``os.replace`` makes the final swap atomic but
+    does **not** protect the surrounding read/fetch/merge/replace sequence: two
+    concurrent processes could each read the same snapshot, fetch disjoint
+    windows, and have the later replace discard the earlier process's additions
+    while both report success. Holding an exclusive ``flock`` across the whole
+    sequence serializes concurrent merges so each one operates on the prior
+    one's completed archive.
+
+    The lock is taken on the archive's own directory, not on a separate lock
+    file. The archive itself cannot carry it (each merge replaces the file, so
+    its inode changes), while the directory is the same object for every
+    process whatever its ``TMPDIR`` — a cron job and an interactive shell
+    contend on the same lock — and nothing is created in a shared temp
+    directory under a predictable name.
+
+    Only a path validated by ``_safe_output_path`` is ever opened. Locking is
+    best-effort: without ``fcntl`` (e.g. Windows), for a symlinked path (which
+    the read and write steps refuse anyway), before the directory exists
+    (nothing to race on yet), or on a filesystem that does not support
+    ``flock``, the sequence proceeds unserialized.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    try:
+        directory = _safe_output_path(Path(path)).parent
+    except ValueError:
+        # A symlinked target or parent is refused by the read and write steps
+        # themselves, each with its own message; do not open it here.
+        yield
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(fd)
+
+
+def _load_merge_archive(args, start_date, progress_file):
+    """Load the existing archive for ``--merge`` and pick the query start date.
+
+    Returns ``(existing_records, start_date)``. ``existing_records`` is ``None``
+    when merge mode is off. With no explicit ``--start-date`` the earliest
+    archived transaction date is queried forward.
+    """
+    if not (getattr(args, "merge", False) and args.output_transactions):
+        return None, start_date
+    try:
+        validated_path = _safe_output_path(args.output_transactions)
+        existing_records = _read_existing_transaction_records(validated_path)
+    except _ArchiveReadError as e:
+        print(f"[!] Cannot merge: {e} The archive was left unchanged.", file=sys.stderr)
+        raise _CliExit(1)
+    if existing_records and not start_date:
+        earliest = _earliest_transaction_date(existing_records)
+        if earliest:
+            start_date = earliest
+            if not args.quiet:
+                print(f"[*] Merge: querying from earliest archived date {earliest} forward.", file=progress_file)
+    return existing_records, start_date
+
+
+def _merge_into_archive(args, existing_records, transactions_res, progress_file):
+    """Delta-merge the fetched window into the archive, newest-first."""
+    fetched_count = len(transactions_res.transactions)
+    merged = _newest_first(merge_transaction_records(existing_records, transactions_res.transactions))
+    if not args.quiet:
+        print(
+            f"[+] Merge: {fetched_count} fetched transaction(s) merged into "
+            f"{len(existing_records)} archived ({len(merged)} total).",
+            file=progress_file,
+        )
+    return _summarize_transactions(merged, mode=transactions_res.mode)
+
+
+def _fetch_transactions(args, client, progress_file):
+    end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Merge mode performs a read/fetch/merge/replace sequence that is not atomic
+    # as a whole. Serialize the entire sequence under an exclusive archive lock
+    # so two concurrent merges cannot read the same snapshot and have the later
+    # os.replace silently drop the earlier process's additions. A non-merge fetch
+    # overwrites unconditionally, so it needs no lock.
+    merge_enabled = bool(getattr(args, "merge", False) and args.output_transactions)
+    # Validate the output path before acquiring the lock to prevent path traversal attacks.
+    validated_output_path = (
+        _safe_output_path(args.output_transactions) if merge_enabled else None
+    )
+    lock = (
+        _archive_lock(validated_output_path) if merge_enabled else contextlib.nullcontext()
+    )
+
+    with lock:
+        # Merge mode: load any existing archive up front so the fetched window can be
+        # delta-merged into it rather than clobbering multi-year history.
+        existing_records, start_date = _load_merge_archive(args, args.start_date, progress_file)
+
+        # Beancount reconstruction requires complete transaction history, not truncated.
+        # Apply limit only for display purposes (via render functions), not the fetch.
+        tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
+        transactions_res = client.fetch_transactions(
+            start_date=start_date,
+            end_date=end_date,
+            user_account_ids=args.account_id,
+            limit=tx_limit,
+        )
+
+        if existing_records:
+            transactions_res = _merge_into_archive(args, existing_records, transactions_res, progress_file)
+
+        t_data = transactions_res.to_dict()
+        t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
+
+        _write_transactions_output(args, transactions_res, t_data, progress_file)
     return transactions_res
 
 
