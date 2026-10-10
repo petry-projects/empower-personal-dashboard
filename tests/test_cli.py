@@ -420,6 +420,22 @@ class TestMergeTransactionRecords(unittest.TestCase):
         # Keyed record updated
         self.assertEqual(next(m for m in merged if m.get("user_transaction_id") == "A")["amount"], 3.0)
 
+    def test_keyless_incoming_records_do_not_accumulate(self):
+        # A record without an id cannot be matched by key, but re-merging the
+        # identical record on every run must not append another copy each time.
+        from empower_personal_dashboard.cli import merge_transaction_records
+
+        keyless = {"transaction_date": "2026-09-20", "description": "No id", "amount": 4.0}
+        other_keyless = {"transaction_date": "2026-09-21", "description": "Other", "amount": 6.0}
+
+        first = merge_transaction_records([], [dict(keyless)])
+        second = merge_transaction_records(first, [dict(keyless), dict(other_keyless)])
+        third = merge_transaction_records(second, [dict(keyless), dict(other_keyless)])
+
+        self.assertEqual(first, [keyless])
+        self.assertEqual(second, [keyless, other_keyless])
+        self.assertEqual(third, [keyless, other_keyless])
+
 
 class TestCliMerge(unittest.TestCase):
     def _mk_result(self, transactions):
@@ -880,6 +896,28 @@ class TestCliMerge(unittest.TestCase):
             self.assertNotIn("Unexpected error", err)
             mock_txs.assert_not_called()
             self.assertEqual(out.read_text(encoding="utf-8"), original)
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_refuses_json_object_without_transactions_list(self, mock_txs):
+        # A .json target that is an object with no list-valued "transactions"
+        # is not an archive this tool wrote. Reading it as "empty" would let the
+        # merge overwrite it with only the fetched window.
+        mock_txs.return_value = self._mk_result([
+            {"user_transaction_id": "TX3", "transaction_date": "2026-09-20", "description": "New", "amount": 7.0},
+        ])
+        for payload in ({"note": "not an archive"}, {"transactions": None}, {"transactions": {"OLD1": {}}}):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmpdir:
+                out = Path(tmpdir) / "transactions.json"
+                original = json.dumps(payload)
+                out.write_text(original, encoding="utf-8")
+                mock_txs.reset_mock()
+
+                code, err = self._run_merge(out)
+
+                self.assertEqual(code, 1)
+                self.assertIn("left unchanged", err)
+                mock_txs.assert_not_called()
+                self.assertEqual(out.read_bytes(), original.encode("utf-8"))
 
     @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
     def test_merge_refuses_non_object_archive_entries(self, mock_txs):

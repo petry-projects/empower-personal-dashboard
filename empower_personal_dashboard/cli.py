@@ -815,24 +815,39 @@ def merge_transaction_records(existing, incoming):
       the queried window — are preserved untouched.
 
     Records lacking a ``user_transaction_id`` cannot be keyed, so they are preserved as-is
-    (existing ones kept, incoming ones appended).
+    (existing ones kept, incoming ones appended). An incoming one that is identical to a
+    record already present is not appended again, so re-fetching the same window on every
+    run does not pile up copies.
     """
     merged = []
     index = {}  # user_transaction_id -> position in merged
+    unkeyed = set()  # canonical form of every record that has no id
     for rec in existing:
         tid = rec.get("user_transaction_id")
         if tid:
             index[str(tid)] = len(merged)
+        else:
+            unkeyed.add(_canonical_record(rec))
         merged.append(dict(rec))
     for rec in incoming:
         tid = rec.get("user_transaction_id")
         if tid and str(tid) in index:
             merged[index[str(tid)]] = dict(rec)
+            continue
+        if tid:
+            index[str(tid)] = len(merged)
         else:
-            if tid:
-                index[str(tid)] = len(merged)
-            merged.append(dict(rec))
+            canonical = _canonical_record(rec)
+            if canonical in unkeyed:
+                continue
+            unkeyed.add(canonical)
+        merged.append(dict(rec))
     return merged
+
+
+def _canonical_record(rec):
+    """Order-independent text form of a record, for comparing records that have no id."""
+    return json.dumps(rec, sort_keys=True, default=str, ensure_ascii=False)
 
 
 class _ArchiveReadError(ValueError):
@@ -867,7 +882,10 @@ def _parse_json_archive(text, path):
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise _ArchiveReadError(f"{path} is not valid JSON (line {e.lineno}: {e.msg}).") from e
-    records = data.get("transactions", []) if isinstance(data, dict) else data
+    # A dict must carry the list under "transactions". Reading a dict without it
+    # as an empty archive would let the merge overwrite a file this tool did not
+    # write with only the fetched window.
+    records = data.get("transactions") if isinstance(data, dict) else data
     if not isinstance(records, list):
         raise _ArchiveReadError(f"{path} does not contain a list of transactions.")
     for idx, rec in enumerate(records):
