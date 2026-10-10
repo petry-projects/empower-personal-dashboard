@@ -7,15 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-10
+
 ### Added
 - Intelligent delta merge for transaction archives ([#51](https://github.com/petry-projects/empower-personal-dashboard/issues/51)):
   - Added `--merge` CLI flag that merges freshly fetched transactions into an existing `--output-transactions` file (`.jsonl` or `.json`) by `user_transaction_id`. Matching records are updated in place (e.g. `status` revised from `pending` to `posted`, revised amounts/dates), new records are appended, and older historical transactions outside the queried window are preserved — so a default ~90-day fetch no longer clobbers a multi-year archive.
   - Added earliest-date auto-detection: when `--merge` is set, `--start-date` is omitted, and the target file exists, the CLI queries from the earliest archived transaction date forward.
   - Merged archives are written newest-first, matching the order the fetcher returns, so newly fetched rows lead the output; undated records sort last.
   - A `--merge` run refuses to proceed when the existing archive is not valid JSON/JSONL, contains non-object entries, or is a JSON object without a `transactions` list, reporting the parse error and leaving the archive unchanged rather than dropping the unreadable records on rewrite.
+  - The whole read, fetch, merge and replace sequence runs under an exclusive lock on the archive's directory, so concurrent `--merge` runs cannot drop each other's additions ([#68](https://github.com/petry-projects/empower-personal-dashboard/issues/68)). Locking is best-effort where `flock` is unavailable.
+  - Earliest-date auto-detection only considers canonical `YYYY-MM-DD` dates, and an incoming record without a `user_transaction_id` that is identical to one already archived is not appended again.
 
 ### Changed
 - `--output-transactions` files (`.jsonl` and `.json`) are now written through a temporary file and an atomic rename, so a crash, full disk or serialization error mid-write can no longer truncate an existing transaction archive. An existing file keeps its owner permission bits; group and other access is dropped when it is rewritten.
+- Session files are now written in format version 2, which stores each cookie with its full attributes ([#52](https://github.com/petry-projects/empower-personal-dashboard/issues/52)). Version 1 files written by earlier releases still load. Earlier releases cannot read a version 2 file and will ask for a fresh `--login`.
+- The session file path and the debug log file path are validated before use: a path containing a NUL byte, or one that is a symlink or sits inside a symlinked directory, is refused with a `ValueError`.
+
+### Fixed
+- Saved sessions no longer lose cookie attributes. Cookies were flattened to `{name: value}`, discarding domain, path, expiry, `Secure` and `HttpOnly`/`SameSite`, and keeping only one of several cookies that shared a name across domains or paths. Each cookie is now restored with its original scope, including host-only cookies ([#52](https://github.com/petry-projects/empower-personal-dashboard/issues/52)).
+- Logging in on a client that already holds session cookies no longer replaces the authenticated `JSESSIONID` with the unauthenticated one issued by the login landing page, which caused `[Error 201] Session not authenticated` on the next call. The CSRF token is now scraped through a separate throwaway session in that case ([#53](https://github.com/petry-projects/empower-personal-dashboard/issues/53)).
 
 ## [0.2.0] - 2026-10-04
 
@@ -79,7 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Authoritative OpenAPI 3.1 specification (`docs/openapi.yaml`) with Redocly CI linting and hermetic contract tests.
 - PyPI onboarding probe, build verification, and Trusted Publishing OIDC workflow.
 
-[Unreleased]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/petry-projects/empower-personal-dashboard/compare/v0.1.0...v0.1.1
