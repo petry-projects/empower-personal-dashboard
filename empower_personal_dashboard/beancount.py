@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+from empower_personal_dashboard.exceptions import LedgerAppendError
 from empower_personal_dashboard.models import (
     DashboardBalances,
     DashboardHoldings,
@@ -36,6 +37,11 @@ BEANCOUNT_ACCOUNT_REGEX = re.compile(
 # dates are clamped to never precede it, so a reconstructed lot cannot post
 # against an account Beancount considers not yet open.
 _ACCOUNT_OPEN_DATE = "2000-01-01"
+
+# Comment marker persisting the earliest reconstructed window boundary in a
+# holdings section, so an append can detect (and reject) a window broadened into
+# the past, which would leave the already-exported opening lot stale.
+_WINDOW_START_MARKER = "empower_window_start"
 
 # Canonical Beancount account names reused across multiple generators.
 ACCT_OPENING_BALANCES = "Equity:Opening-Balances"
@@ -1012,7 +1018,8 @@ class BeancountGenerator:
         self._emit_cash_liability_assertions(
             balances, transactions, acct_lookup, commodity_accounts, lines
         )
-        self._emit_commodity_unit_assertions(holdings, acct_lookup, lines)
+        reconciled_keys = self._shortfall_reconciled_keys(holdings, transactions, acct_lookup)
+        self._emit_commodity_unit_assertions(holdings, acct_lookup, lines, reconciled_keys)
 
         return "".join(lines)
 
@@ -1052,33 +1059,89 @@ class BeancountGenerator:
                 lines.append(f"2020-01-01 pad {b_account} {ACCT_OPENING_BALANCES}\n")
             lines.append(f"{as_of} balance {b_account} {bal_amt:.2f} {curr}\n")
 
+    def _shortfall_reconciled_keys(
+        self,
+        holdings: Optional[DashboardHoldings],
+        transactions: Optional[DashboardTransactions],
+        acct_lookup: Dict[str, Dict[str, Any]],
+    ) -> Set[Tuple[str, str]]:
+        """Return the (b_account, ticker) keys that get a deficit-floor shortfall reconciliation.
+
+        Mirrors the floor-surplus detection in :meth:`_emit_snapshot_lots`: a
+        still-held long position whose opening lot is floored above
+        ``snapshot - net_buys`` ends the window with surplus units that an
+        explicit reconciliation disposes on the day *after* the snapshot. Only
+        the balance assertion for one of these keys must wait a further day so
+        the reconciliation posts first; every other assertion stays at D+1.
+        """
+        reconciled: Set[Tuple[str, str]] = set()
+        if not (transactions and transactions.transactions):
+            return reconciled
+        if not (holdings and holdings.holdings and holdings.as_of_date):
+            return reconciled
+        net_buys, net_buy_meta = self._compute_net_buys(transactions, acct_lookup)
+        aggregated = self._aggregate_snapshot_holdings(holdings, acct_lookup)
+        for key, pos in aggregated.items():
+            naive_baseline = pos.get("quantity", 0.0) - net_buys.get(key, 0.0)
+            # The floor is a long-only construct; a negative naive baseline stays
+            # negative and never earns a reconciliation.
+            if naive_baseline < 0:
+                continue
+            max_deficit = net_buy_meta.get(key, {}).get("max_deficit", 0.0)
+            baseline_qty = max(naive_baseline, max_deficit)
+            # A baseline rounding to zero emits no opening lot (hence no
+            # reconciliation), matching the _emit_snapshot_lots skip.
+            if round(baseline_qty, 6) == 0:
+                continue
+            if round(baseline_qty - naive_baseline, 6) > 0:
+                reconciled.add(key)
+        return reconciled
+
     def _emit_commodity_unit_assertions(
         self,
         holdings: Optional[DashboardHoldings],
         acct_lookup: Dict[str, Dict[str, Any]],
         lines: List[str],
+        reconciled_keys: Optional[Set[Tuple[str, str]]] = None,
     ) -> None:
-        """Emit aggregated per-(account, ticker) commodity unit balance assertions."""
+        """Emit aggregated per-(account, ticker) commodity unit balance assertions.
+
+        Beancount evaluates balance directives at the beginning of the day, so a
+        trade dated on ``as_of`` has not yet posted when an assertion dated
+        ``as_of`` is checked. Asserting the snapshot on the following day (D+1)
+        therefore counts all same-day activity — the date used for an ordinary
+        position.
+
+        Only a position carrying a deficit-floor shortfall reconciliation (which
+        posts on D+1, after same-day activity) has its assertion pushed one more
+        day forward (D+2) so the reconciliation is applied before the balance is
+        checked. Delaying *every* assertion to D+2 would make an unreconciled
+        position wrongly absorb a genuine D+1 trade in that commodity, which on
+        append invalidates the preserved assertion.
+        """
         if not (holdings and holdings.holdings):
             return
+        reconciled_keys = reconciled_keys or set()
         as_of = holdings.as_of_date
-        # Beancount evaluates balance directives at the beginning of the day,
-        # so a trade dated on as_of has not yet posted when an assertion dated
-        # as_of is checked. Asserting the snapshot on the following day counts
-        # all same-day activity and keeps the reconstructed inventory exact.
         try:
-            assert_date = (
-                datetime.date.fromisoformat(as_of) + datetime.timedelta(days=1)
-            ).isoformat()
+            base = datetime.date.fromisoformat(as_of)
+            next_day = (base + datetime.timedelta(days=1)).isoformat()
+            reconciled_day = (base + datetime.timedelta(days=2)).isoformat()
         except Exception:
-            assert_date = as_of
-        lines.append(f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, asserted {assert_date})\n")
+            next_day = reconciled_day = as_of
+        lines.append(
+            f"\n;; Investment Commodity Unit Balances (snapshot as of {as_of}, "
+            f"asserted D+1 — or D+2 for a position with a shortfall reconciliation)\n"
+        )
         # Aggregate positions by (b_account, ticker) to avoid duplicate conflicting balance assertions
         holding_units: Dict[Tuple[str, str], float] = {}
         for h in holdings.holdings:
             ticker = _clean_ticker(h.get("ticker"))
             qty = float(h.get("quantity") or 0.0)
-            if not (ticker and round(qty, 6) > 0):
+            # A short position reports a negative quantity; assert it as-is so the
+            # reconstructed inventory is checked end to end. Only a ticker-less or
+            # zero-rounding row is skipped.
+            if not ticker or round(qty, 6) == 0:
                 continue
             firm, acct_name, acct_type, acct_id = _resolve_account_from_holding(h, acct_lookup)
             b_account = self.mapper.resolve_account(firm, acct_name, acct_id, account_type=acct_type, is_asset=True)
@@ -1087,9 +1150,11 @@ class BeancountGenerator:
         for (b_account, ticker), total_qty in sorted(holding_units.items()):
             # Skip aggregates that cancel to zero at six-decimal precision: the
             # opening-lot emitter uses the same rounding rule, so asserting a
-            # commodity whose lot was not created would fail the ledger.
-            if round(total_qty, 6) <= 0:
+            # commodity whose lot was not created would fail the ledger. Negative
+            # (short) aggregates are asserted as negative unit balances.
+            if round(total_qty, 6) == 0:
                 continue
+            assert_date = reconciled_day if (b_account, ticker) in reconciled_keys else next_day
             lines.append(f"{assert_date} balance {b_account} {_format_quantity(total_qty)} {ticker}\n")
 
     def generate_prices_bean(
@@ -1115,6 +1180,55 @@ class BeancountGenerator:
 
         return "".join(lines)
 
+    @staticmethod
+    def _guard_window_not_broadened(existing_content: Optional[str], lot_date: str) -> None:
+        """Reject an append whose opening lot predates the persisted window start.
+
+        The holdings section records its earliest reconstructed window boundary in
+        a ``;; empower_window_start: <date>`` marker. When appending, a new opening
+        lot dated before that boundary would broaden the window into the past, but
+        the already-exported opening lot is never revised — so the historical
+        inventory would be inconsistent. Such an append is rejected.
+
+        The marker lives in the header, which ``_strip_bean_header`` removes from
+        every appended body, so a ``holdings.bean`` first written by an older
+        release (or by a prior append) never carries it. When it is absent we fall
+        back to the earliest existing opening-lot date (directives posting to
+        ``Equity:Opening-Balances``), so the guard still rejects a
+        backward-broadening append instead of silently permitting it.
+        """
+        if not existing_content:
+            return
+        pattern = re.escape(_WINDOW_START_MARKER) + r":\s*(\S+)"
+        m = re.search(pattern, existing_content)
+        if m:
+            prior_start = m.group(1).strip()
+        else:
+            # No marker (legacy file, or a body stripped of its header): derive the
+            # earliest existing *opening-lot* date instead. Only directives that
+            # post to ``Equity:Opening-Balances`` are reconstructed opening lots, so
+            # restricting to those avoids mistaking a later snapshot/price directive
+            # for the window boundary.
+            opening_dates = [
+                block_match.group(1)
+                for block in re.split(r"\n\s*\n", existing_content)
+                if ACCT_OPENING_BALANCES in block
+                for block_match in [re.match(r"\s*(\d{4}-\d{2}-\d{2})\b", block)]
+                if block_match
+            ]
+            if not opening_dates:
+                return
+            # ISO ``YYYY-MM-DD`` dates compare chronologically under a lexical compare.
+            prior_start = min(opening_dates)
+        # ISO ``YYYY-MM-DD`` dates compare chronologically under a lexical compare.
+        if lot_date and prior_start and lot_date < prior_start:
+            raise LedgerAppendError(
+                f"Refusing to append: opening lot date {lot_date!r} predates the "
+                f"previously exported window start {prior_start!r}. Broadening the "
+                f"window into the past would leave the existing opening lot stale; "
+                f"regenerate the ledger instead of appending."
+            )
+
     def generate_holdings_bean(
         self,
         holdings: Optional[DashboardHoldings] = None,
@@ -1124,17 +1238,28 @@ class BeancountGenerator:
         *,
         transactions: Optional[DashboardTransactions] = None,
     ) -> str:
-        """Generate investment positions with lot cost-basis and price tracking."""
-        lines = [
-            ";; ==============================================================================\n"
-            ";; Empower Personal Dashboard - Portfolio Holdings & Lots\n"
-            ";; ==============================================================================\n\n"
-        ]
+        """Generate investment positions with lot cost-basis and price tracking.
 
+        When appending to an existing holdings section, the previously exported
+        window-start boundary is honoured: an append whose opening lot predates it
+        broadens the window into the past, which would leave the already-written
+        opening lot stale. That is rejected with :class:`LedgerAppendError` rather
+        than silently producing an inconsistent historical inventory.
+        """
         # Must reconstruct opening lots for fully-sold positions even if the holdings
         # snapshot is empty, or sells will reduce an empty inventory and the ledger
         # will fail to load. The emit helpers therefore run regardless of holdings.
         lot_date = self._resolve_lot_date(holdings, opening_date, transactions, balances)
+
+        self._guard_window_not_broadened(existing_content, lot_date)
+
+        lines = [
+            ";; ==============================================================================\n"
+            ";; Empower Personal Dashboard - Portfolio Holdings & Lots\n"
+            ";; " + _WINDOW_START_MARKER + ": " + lot_date + "\n"
+            ";; ==============================================================================\n\n"
+        ]
+
         acct_lookup = _build_account_lookup(balances)
 
         # Existing holding tags to skip on append
@@ -1145,8 +1270,10 @@ class BeancountGenerator:
         net_buys, net_buy_meta = self._compute_net_buys(transactions, acct_lookup)
         aggregated_holdings = self._aggregate_snapshot_holdings(holdings, acct_lookup)
 
+        snapshot_date = holdings.as_of_date if holdings else None
         self._emit_snapshot_lots(
-            aggregated_holdings, net_buys, net_buy_meta, transactions, existing_keys, lot_date, lines
+            aggregated_holdings, net_buys, net_buy_meta, transactions, existing_keys,
+            lot_date, snapshot_date, lines,
         )
         self._emit_reconstructed_opening_lots(
             net_buys, net_buy_meta, aggregated_holdings, existing_keys, lot_date, transactions, lines
@@ -1317,7 +1444,9 @@ class BeancountGenerator:
         for h in holdings.holdings:
             ticker = _clean_ticker(h.get("ticker"))
             qty = float(h.get("quantity") or 0.0)
-            if not (ticker and qty > 0):
+            # Preserve negative (short) quantities: only a ticker-less row or one
+            # whose quantity rounds to zero at the emitted precision is dropped.
+            if not ticker or round(qty, 6) == 0:
                 continue
             price = float(h.get("price") or 0.0)
             cost_basis = h.get("cost_basis")
@@ -1355,6 +1484,7 @@ class BeancountGenerator:
         transactions: Optional[DashboardTransactions],
         existing_keys: Set[str],
         lot_date: str,
+        snapshot_date: Optional[str],
         lines: List[str],
     ) -> None:
         """Emit the baseline opening lot for each snapshot position acquired before the window."""
@@ -1368,20 +1498,31 @@ class BeancountGenerator:
             snapshot_qty = pos.get("quantity", 0.0)
             key = (b_account, ticker)
             # Baseline Opening Qty = Current Snapshot Qty - Net Buys within window.
-            baseline_qty = snapshot_qty - net_buys.get(key, 0.0) if has_tx else snapshot_qty
-            # A snapshot position that is still held can nonetheless dip below the
-            # opening quantity mid-window (e.g. a sell-then-buy whose net is zero):
-            # floor the opening lot at the deepest intermediate deficit, mirroring
-            # the reconstructed-lot path, so the earlier sale has inventory to book
-            # against instead of failing the ledger before the later purchase.
-            if has_tx:
+            naive_baseline = snapshot_qty - net_buys.get(key, 0.0) if has_tx else snapshot_qty
+            baseline_qty = naive_baseline
+            # A still-held *long* position can dip below its naive opening quantity
+            # mid-window (e.g. a sell-then-buy whose net is zero): floor the opening
+            # lot at the deepest intermediate deficit, mirroring the reconstructed-lot
+            # path, so the earlier sale has inventory to book against instead of
+            # failing the ledger before the later purchase. The floor is a long-only
+            # construct (a negative/short baseline must stay negative), so apply it
+            # only when the naive baseline is non-negative.
+            floor_surplus = 0.0
+            if has_tx and naive_baseline >= 0:
                 max_deficit = net_buy_meta.get(key, {}).get("max_deficit", 0.0)
-                baseline_qty = max(baseline_qty, max_deficit)
+                baseline_qty = max(naive_baseline, max_deficit)
+                # Flooring above ``snapshot - net_buys`` over-provisions the opening
+                # lot, so the reconstructed final quantity would exceed the asserted
+                # snapshot (unknown same-day sell/buy ordering). Record the surplus
+                # so an explicit shortfall reconciliation below brings the final
+                # quantity back to the snapshot.
+                floor_surplus = baseline_qty - naive_baseline
             # Skip only positions whose baseline rounds to zero at the emitted
             # six-decimal precision — acquired entirely within the window — so a
-            # legitimate micro-position that still earns a balance assertion
-            # (_emit_commodity_unit_assertions) is not dropped from the opening lot.
-            if round(baseline_qty, 6) <= 0:
+            # legitimate micro-position (long or short) that still earns a balance
+            # assertion (_emit_commodity_unit_assertions) is not dropped from the
+            # opening lot.
+            if round(baseline_qty, 6) == 0:
                 continue
             holding_tag = f"{b_account}:{ticker}"
             if holding_tag in existing_keys:
@@ -1395,6 +1536,57 @@ class BeancountGenerator:
                 b_account, baseline_qty, snapshot_qty, pos.get("price", 0.0), pos.get("cost_basis"),
                 force_cost,
             )
+            if round(floor_surplus, 6) > 0 and snapshot_date:
+                self._append_shortfall_reconciliation(
+                    lines, snapshot_date, pos.get("firm", _FIRM_BROKERAGE), ticker,
+                    holding_tag, b_account, floor_surplus, pos.get("price", 0.0),
+                )
+
+    def _append_shortfall_reconciliation(
+        self,
+        lines: List[str],
+        snapshot_date: str,
+        firm: str,
+        ticker: str,
+        holding_tag: str,
+        b_account: str,
+        surplus: float,
+        price: float = 0.0,
+    ) -> None:
+        """Dispose a deficit-floor surplus on the snapshot date to match the assertion.
+
+        When the running-deficit floor lifts the opening lot above
+        ``snapshot - net_buys``, the reconstructed inventory ends the window with
+        ``surplus`` extra units that the snapshot assertion does not expect. The
+        exact timing is unknowable (same-day sell/buy ordering), so the surplus is
+        reconciled explicitly against ``Equity:Opening-Balances`` on the day after
+        the snapshot — after same-day activity — rather than silently breaking
+        the ledger. The reduction is booked at the snapshot price so the equity
+        posting balances correctly.
+        """
+        payee_esc = _escape_beancount_string(f"{firm} Snapshot Shortfall Reconciliation")
+        narration_esc = _escape_beancount_string(f"{ticker} Deficit Floor Adjustment")
+        reconciliation_date = snapshot_date
+        try:
+            reconciliation_date = (
+                datetime.date.fromisoformat(snapshot_date) + datetime.timedelta(days=1)
+            ).isoformat()
+        except (TypeError, ValueError):
+            pass
+        lines.append(f'{reconciliation_date} * "{payee_esc}" "{narration_esc}"\n')
+        lines.append(f'  empower_holding: "{holding_tag}"\n')
+        # Reduce the opening lot with an empty cost spec ``{}`` so the reduction
+        # applies to the *costed* lot that ``_append_snapshot_lot`` emits when the
+        # ticker had a sale in the window (``force_cost``). A bare ``@ price``
+        # posting without ``{}`` books a separate uncosted leg, leaving two lots
+        # (e.g. ``10 GE {12 USD}`` and an uncosted ``-5 GE``): the unit assertion
+        # still passes but the cost basis is wrong. Keep the ``@ price`` annotation
+        # when priced and let the equity leg auto-balance at the booked cost.
+        price_str = f" @ {_format_price(price)} USD" if price > 0 else ""
+        lines.append(
+            f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}{price_str}\n"
+        )
+        lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
 
     def _append_snapshot_lot(
         self,
@@ -1844,6 +2036,15 @@ class BeancountGenerator:
         dest.mkdir(parents=True, exist_ok=True)
         effective_opening_date = _determine_opening_date(transactions, balances, opening_date)
 
+        # Pre-flight the backward-broadening guard *before* any file is written.
+        # The guard otherwise fires inside ``_write_modular_holdings``, i.e. after
+        # main.bean / accounts.bean / balances.bean have already been overwritten,
+        # which would leave the existing ledger partially updated on a rejected
+        # append. Validating up front makes the export all-or-nothing.
+        self._preflight_modular_append_guard(
+            dest, append, holdings, balances, transactions, effective_opening_date,
+        )
+
         created_files: List[Path] = [
             self._write_modular_main(dest, append),
             self._write_modular_section(
@@ -1863,6 +2064,35 @@ class BeancountGenerator:
             self._write_modular_transactions(dest, append, transactions, balances),
         ]
         return created_files
+
+    def _preflight_modular_append_guard(
+        self,
+        dest: Path,
+        append: bool,
+        holdings: Optional[DashboardHoldings],
+        balances: Optional[DashboardBalances],
+        transactions: Optional[DashboardTransactions],
+        effective_opening_date: Optional[str],
+    ) -> None:
+        """Reject a backward-broadening append before any modular file is touched.
+
+        Mirrors the ``existing_content``/``lot_date`` resolution that
+        ``_write_modular_holdings`` would perform, then runs
+        :meth:`_guard_window_not_broadened`. Running it here — ahead of every
+        write in :meth:`export_modular_ledger` — guarantees a rejected append
+        raises :class:`LedgerAppendError` without having partially rewritten
+        main.bean / accounts.bean / balances.bean. The guard re-runs harmlessly
+        (idempotently) inside ``generate_holdings_bean`` later on.
+        """
+        holdings_path = dest / "holdings.bean"
+        if not (append and holdings_path.exists()):
+            return
+        _verify_not_symlink(holdings_path)
+        existing_h_text = holdings_path.read_text(encoding="utf-8")
+        lot_date = self._resolve_lot_date(
+            holdings, effective_opening_date, transactions, balances,
+        )
+        self._guard_window_not_broadened(existing_h_text, lot_date)
 
     def _write_modular_section(self, dest: Path, filename: str, content: str) -> Path:
         """Write a freshly generated modular component file (always overwritten)."""
@@ -2008,6 +2238,13 @@ class BeancountGenerator:
         """Append new assertions, lots, prices, and non-duplicate transactions to an existing ledger."""
         existing_content = target.read_text(encoding="utf-8")
         existing_ids = set(re.findall(r'empower_id:\s*"([^"]+)"', existing_content))
+
+        # Validate that the append won't broaden the transaction window into the
+        # past before writing any patches to the file. The guard must run with
+        # the same lot_date resolution as generate_holdings_bean.
+        if holdings or (transactions and transactions.transactions):
+            lot_date = self._resolve_lot_date(holdings, effective_opening_date, transactions, balances)
+            self._guard_window_not_broadened(existing_content, lot_date)
 
         # Ensure a FIFO booking method is declared so appended sale transactions
         # resolve against the oldest lot even when the file was created by an

@@ -49,3 +49,28 @@ class LoginFailedException(EmpowerError):
     """Raised when authentication credentials or 2FA verification fails."""
 
     pass
+
+
+class ReconstructionWindowError(EmpowerError):
+    """Raised when a transaction window cannot reconstruct a holdings snapshot.
+
+    The Beancount growth-curve reconstruction derives each opening lot from
+    ``snapshot - net_buys`` over the fetched transaction range. When that range
+    ends before ``holdings.as_of_date``, trades after the range are omitted and
+    the baseline silently absorbs them. The fetch-layer guard raises this under
+    its ``"error"`` policy so the mismatch is surfaced instead of masked.
+    """
+
+    pass
+
+
+class LedgerAppendError(EmpowerError):
+    """Raised when appending to a ledger would broaden its window into the past.
+
+    A prior export persists the earliest reconstructed window boundary. An append
+    whose opening lot predates that boundary cannot revise the already-written
+    opening lot, so the historical inventory would be wrong. The append is
+    rejected rather than silently leaving the stale opening lot in place.
+    """
+
+    pass

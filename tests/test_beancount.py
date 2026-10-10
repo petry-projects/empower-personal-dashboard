@@ -347,8 +347,10 @@ class TestBeancountGenerator(unittest.TestCase):
         self.assertIn("2026-10-01 balance Assets:AllyBank:EverydayChecking 5000.00 USD", output)
         # Credit liability balance is asserted as negative in Beancount
         self.assertIn("2026-10-01 balance Liabilities:Chase:SapphireReserve -2000.00 USD", output)
-        # Commodity balance assertions are dated the day after the snapshot so
-        # Beancount's beginning-of-day evaluation counts any same-day trades.
+        # Commodity balance assertions are dated the day after the snapshot (D+1)
+        # so same-day trades are counted. These positions carry no deficit-floor
+        # shortfall reconciliation (no transactions here), so they stay at D+1
+        # rather than being pushed to D+2.
         self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 40.000000 VTI", output)
         self.assertIn("2026-10-02 balance Assets:Vanguard:Brokerage 10.000000 BND", output)
 
@@ -1357,7 +1359,10 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         self.assertIn('2022-03-10 * "Acme Brokerage" "Buy AAPL"', tx_output)
 
         # Final commodity balance assertions are dated the day after the snapshot
-        # (2024-10-02) and assert full portfolio snapshot quantities: 60 VTI and 15 AAPL
+        # (2024-10-02) and assert full portfolio snapshot quantities: 60 VTI and 15 AAPL.
+        # Neither position is deficit-floored (VTI nets +10 with no intermediate
+        # deficit; AAPL's baseline is zero), so no shortfall reconciliation posts
+        # and both assertions stay at D+1 rather than D+2.
         bal_output = self.generator.generate_balances_bean(
             balances=self.balances,
             holdings=self.holdings_snapshot,
@@ -1393,6 +1398,95 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
             accounts_bean = (dest / "accounts.bean").read_text(encoding="utf-8")
             self.assertIn("open Income:CapitalGains", accounts_bean)
             self.assertIn("open Income:Dividends USD", accounts_bean)
+
+    def test_rejected_backward_append_leaves_ledger_unmodified(self):
+        """A backward-broadening append must abort before rewriting any file.
+
+        The window guard is pre-flighted in ``export_modular_ledger`` ahead of
+        every write, so a rejected append leaves main.bean / accounts.bean /
+        balances.bean byte-for-byte unchanged instead of partially updated.
+        """
+        from empower_personal_dashboard.exceptions import LedgerAppendError
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            dest = Path(tmp_dir) / "ledger"
+            self.generator.export_modular_ledger(
+                destination_dir=dest,
+                balances=self.balances,
+                holdings=self.holdings_snapshot,
+                transactions=self.transactions_history,
+                opening_date="2020-01-01",
+            )
+            before = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted(dest.glob("*.bean"))
+            }
+            # A second account the first export never saw: if any write runs
+            # before the guard fires, accounts.bean/balances.bean would gain this
+            # account, making a partial update observable.
+            mutated_balances = DashboardBalances(
+                as_of_date="2024-10-01",
+                net_worth=26000.0,
+                total_cash=5000.0,
+                total_investment=21000.0,
+                total_card_liabilities=0.0,
+                total_loan=0.0,
+                total_mortgage=0.0,
+                accounts=[
+                    self.balances.accounts[0],
+                    {
+                        "account_id": "ACC-CASH-999",
+                        "account_name": "New Cash Reserve",
+                        "firm_name": "Zenith Bank",
+                        "account_type": "cash",
+                        "balance": 5000.0,
+                        "is_asset": True,
+                        "currency": "USD",
+                        "user_account_id": 5099,
+                    },
+                ],
+            )
+            # Opening the lot in 2018 broadens the persisted 2020 window into the
+            # past, which the guard rejects.
+            backward_txns = DashboardTransactions(
+                start_date="2018-01-01",
+                end_date="2024-10-01",
+                total_transactions=1,
+                money_in=0.0,
+                money_out=4000.0,
+                net_cashflow=-4000.0,
+                transactions=[
+                    {
+                        "user_transaction_id": "tx-2018",
+                        "account_id": "ACC-BRK-001",
+                        "user_account_id": 5001,
+                        "account_name": "Taxable Brokerage",
+                        "firm_name": "Acme Brokerage",
+                        "transaction_date": "2018-06-15",
+                        "description": "Buy VTI",
+                        "amount": 4000.0,
+                        "is_cash_out": True,
+                        "transaction_type": "Buy",
+                        "investment_type": "Buy",
+                        "symbol": "VTI",
+                        "price": 200.0,
+                        "quantity": 20.0,
+                    },
+                ],
+            )
+            with self.assertRaises(LedgerAppendError):
+                self.generator.export_modular_ledger(
+                    destination_dir=dest,
+                    balances=mutated_balances,
+                    holdings=self.holdings_snapshot,
+                    transactions=backward_txns,
+                    opening_date="2018-01-01",
+                )
+            after = {
+                p.name: p.read_text(encoding="utf-8")
+                for p in sorted(dest.glob("*.bean"))
+            }
+            self.assertEqual(before, after)
 
     def test_single_file_export_lifecycle_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1933,6 +2027,49 @@ class TestBeancountInvestmentGrowthReconstruction(unittest.TestCase):
         output = self.generator.generate_holdings_bean(holdings, transactions=churn)
         self.assertIn("10.000000 GE {", output)
 
+    def test_only_reconciled_assertion_is_delayed_to_two_days(self):
+        # GE is deficit-floored (sell 10 then buy 10, net 0, snapshot 5) so it
+        # carries a shortfall reconciliation that posts on D+1; its assertion must
+        # wait until D+2. VTI nets +20 with no intermediate deficit, so it has no
+        # reconciliation and its assertion stays at D+1. Blanket-delaying every
+        # assertion to D+2 would make VTI's assertion wrongly absorb a genuine
+        # D+1 trade on append (see beancount.py:1079 review).
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01",
+            total_value=16860.0,
+            holdings=[
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "ticker": "GE", "quantity": 5.0, "price": 12.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "ticker": "VTI", "quantity": 60.0, "price": 280.0, "cost_basis": 12600.0},
+            ],
+        )
+        txns = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=3,
+            money_in=100.0, money_out=4120.0, net_cashflow=-4020.0,
+            transactions=[
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2024-03-01",
+                 "description": "Sell GE", "amount": 100.0, "is_cash_in": True,
+                 "is_credit": True, "transaction_type": "Sell", "symbol": "GE",
+                 "price": 10.0, "quantity": 10.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2024-08-01",
+                 "description": "Buy GE", "amount": 120.0, "is_cash_out": True,
+                 "transaction_type": "Buy", "symbol": "GE",
+                 "price": 12.0, "quantity": 10.0},
+                {"account_name": "Taxable Brokerage", "firm_name": "Acme Brokerage",
+                 "account_type": "investment", "transaction_date": "2024-08-15",
+                 "description": "Buy VTI", "amount": 4000.0, "is_cash_out": True,
+                 "transaction_type": "Buy", "symbol": "VTI",
+                 "price": 200.0, "quantity": 20.0},
+            ],
+        )
+        bal_output = self.generator.generate_balances_bean(holdings=holdings, transactions=txns)
+        # Reconciled GE waits for D+2; unreconciled VTI stays at D+1.
+        self.assertIn("2024-10-03 balance Assets:AcmeBrokerage:TaxableBrokerage 5.000000 GE", bal_output)
+        self.assertIn("2024-10-02 balance Assets:AcmeBrokerage:TaxableBrokerage 60.000000 VTI", bal_output)
+
     def test_inferred_opening_date_never_precedes_account_opens(self):
         from empower_personal_dashboard.beancount import _determine_opening_date
         pre_2000 = DashboardTransactions(
@@ -2029,6 +2166,28 @@ class TestOpeningDateClamp(unittest.TestCase):
             main_path = gen._write_modular_main(dest, append=False)
             content = main_path.read_text(encoding="utf-8")
             self.assertIn('include "broken_bow.bean"', content)
+
+
+class TestWindowStartGuardFallback(unittest.TestCase):
+    """The backward-broadening guard must still fire on a marker-less holdings file."""
+
+    def test_markerless_existing_content_uses_earliest_lot_date(self):
+        from empower_personal_dashboard.exceptions import LedgerAppendError
+        # A holdings.bean body written by an older release (or any append, whose
+        # stripped body drops the header marker) carries no window-start marker.
+        markerless = (
+            '2022-06-15 * "Acme Brokerage Portfolio Snapshot" "VTI Position"\n'
+            '  empower_holding: "Assets:AcmeBrokerage:Taxable:VTI"\n'
+            "  Assets:AcmeBrokerage:Taxable  20.000000 VTI @ 200.0000 USD\n"
+            "  Equity:Opening-Balances\n\n"
+        )
+        # An append whose opening lot predates the earliest existing dated
+        # directive broadens the window into the past and must be rejected.
+        with self.assertRaises(LedgerAppendError):
+            BeancountGenerator._guard_window_not_broadened(markerless, "2020-01-01")
+        # An append on/after the earliest existing date is permitted.
+        BeancountGenerator._guard_window_not_broadened(markerless, "2022-06-15")
+        BeancountGenerator._guard_window_not_broadened(markerless, "2023-01-01")
 
 
 if __name__ == "__main__":

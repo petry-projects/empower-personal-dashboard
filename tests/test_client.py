@@ -891,6 +891,183 @@ class TestClientDebugEnvFlag(unittest.TestCase):
             self.assertTrue(EmpowerDashboardClient(mock_mode=True, debug=True).debug)
 
 
+class TestReconstructionWindowGuard(unittest.TestCase):
+    """Guard against a transaction window that ends before the holdings snapshot.
+
+    When ``transactions.end_date`` precedes ``holdings.as_of_date`` the Beancount
+    baseline (snapshot - net buys) silently absorbs the omitted post-range trades.
+    """
+
+    def _client(self):
+        return EmpowerDashboardClient(mock_mode=True)
+
+    def _incomplete(self):
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-06-30", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        return holdings, transactions
+
+    def test_warn_policy_returns_unchanged(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        with self.assertLogs("EmpowerDashboardClient", level="WARNING") as cm:
+            result = client.reconcile_transaction_window(transactions, holdings)
+        self.assertIs(result, transactions)
+        self.assertTrue(any("as_of" in m or "window" in m.lower() for m in cm.output))
+
+    def test_error_policy_raises(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        with self.assertRaises(ReconstructionWindowError):
+            client.reconcile_transaction_window(transactions, holdings, policy="error")
+
+    def test_extend_policy_refetches_through_snapshot_date(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        captured = {}
+
+        def fake_fetch(**kwargs):
+            captured.update(kwargs)
+            return DashboardTransactions(
+                start_date=kwargs.get("start_date") or "2024-01-01",
+                end_date=kwargs.get("end_date") or "", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            result = client.reconcile_transaction_window(
+                transactions, holdings, policy="extend",
+            )
+        self.assertEqual(captured.get("end_date"), "2024-10-01")
+        self.assertEqual(result.end_date, "2024-10-01")
+
+    def test_complete_window_is_returned_unchanged_without_warning(self):
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        client = self._client()
+        with patch.object(client.logger, "warning") as warn:
+            result = client.reconcile_transaction_window(transactions, holdings)
+        self.assertIs(result, transactions)
+        warn.assert_not_called()
+
+    def test_unknown_policy_raises_value_error(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        with self.assertRaises(ValueError):
+            client.reconcile_transaction_window(transactions, holdings, policy="erorr")
+
+    def test_extend_rejects_window_still_short_of_snapshot(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings, transactions = self._incomplete()
+        client = self._client()
+
+        def fake_fetch(**kwargs):
+            # Refetch still returns a window that ends before the snapshot date.
+            return DashboardTransactions(
+                start_date=kwargs.get("start_date") or "2024-01-01",
+                end_date="2024-07-31", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            with self.assertRaises(ReconstructionWindowError):
+                client.reconcile_transaction_window(
+                    transactions, holdings, policy="extend",
+                )
+
+    def test_limited_window_with_covering_dates_is_not_complete(self):
+        # A limited fetch keeps the full date bounds while dropping older trades,
+        # so matching bounds must not short-circuit as complete.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        client = self._client()
+        with self.assertLogs("EmpowerDashboardClient", level="WARNING") as cm:
+            result = client.reconcile_transaction_window(
+                transactions, holdings, limited=True,
+            )
+        self.assertIs(result, transactions)
+        self.assertTrue(any("limit" in m.lower() for m in cm.output))
+
+    def test_limited_window_error_policy_raises(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        client = self._client()
+        with self.assertRaises(ReconstructionWindowError):
+            client.reconcile_transaction_window(
+                transactions, holdings, policy="error", limited=True,
+            )
+
+    def test_extend_rejects_window_starting_after_original(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings, transactions = self._incomplete()
+        client = self._client()
+
+        def fake_fetch(**kwargs):
+            # Refetch covers the snapshot end but starts later than the original
+            # window, dropping the earliest trades.
+            return DashboardTransactions(
+                start_date="2024-03-01", end_date="2024-10-01", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            with self.assertRaises(ReconstructionWindowError):
+                client.reconcile_transaction_window(
+                    transactions, holdings, policy="extend",
+                )
+
+    def test_extend_drops_limit_and_date_kwargs(self):
+        holdings, transactions = self._incomplete()
+        client = self._client()
+        captured = {}
+
+        def fake_fetch(**kwargs):
+            captured.update(kwargs)
+            return DashboardTransactions(
+                start_date=kwargs.get("start_date") or "2024-01-01",
+                end_date=kwargs.get("end_date") or "", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            client.reconcile_transaction_window(
+                transactions, holdings, policy="extend",
+                limit=10, start_date="1999-01-01", end_date="1999-12-31",
+                user_account_ids="5001",
+            )
+        # limit/start_date/end_date must not leak through (limit truncates; the
+        # dates would collide with the explicit keywords). user_account_ids does.
+        self.assertNotIn("limit", captured)
+        self.assertEqual(captured.get("start_date"), "2024-01-01")
+        self.assertEqual(captured.get("end_date"), "2024-10-01")
+        self.assertEqual(captured.get("user_account_ids"), "5001")
+
+
 if __name__ == "__main__":
     unittest.main()
 

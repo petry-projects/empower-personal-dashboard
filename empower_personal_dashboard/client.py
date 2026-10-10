@@ -21,6 +21,7 @@ import requests
 from .exceptions import (
     EmpowerError,
     LoginFailedException,
+    ReconstructionWindowError,
     RequireTwoFactorException,
     SessionExpiredError,
 )
@@ -846,6 +847,129 @@ class EmpowerDashboardClient:
             transactions=normalized_txs,
             mode="live",
         )
+
+    @staticmethod
+    def _window_covers_snapshot(tx_end_date: str, as_of_date: str) -> bool:
+        """True when the transaction range extends to (or past) the snapshot date.
+
+        Dates are ISO ``YYYY-MM-DD`` so a lexical comparison is chronological. An
+        empty endpoint is treated as non-covering so the ambiguity is surfaced
+        rather than silently assumed complete.
+        """
+        tx_end = (tx_end_date or "").strip()
+        as_of = (as_of_date or "").strip()
+        if not tx_end or not as_of:
+            return False
+        return tx_end >= as_of
+
+    def reconcile_transaction_window(
+        self,
+        transactions: DashboardTransactions,
+        holdings: DashboardHoldings,
+        policy: str = "warn",
+        limited: bool = False,
+        **fetch_kwargs: Any,
+    ) -> DashboardTransactions:
+        """Guard the Beancount reconstruction window against a short transaction range.
+
+        The growth-curve reconstruction derives every opening lot from
+        ``snapshot - net_buys`` over the fetched transaction range. When that
+        range ends before ``holdings.as_of_date``, trades after the range are
+        omitted and the baseline silently absorbs them, so the reconstructed
+        opening lots are wrong.
+
+        ``limited`` records whether ``transactions`` came from a capped fetch
+        (``fetch_transactions(limit=...)``). A limited fetch drops older trades
+        while keeping the full response date bounds, so matching bounds are *not*
+        proof of coverage: the window is treated as incomplete regardless of its
+        end date, and the ``policy`` below is applied.
+
+        Contract (``policy``):
+          - ``"warn"`` (default): log a warning and return ``transactions`` unchanged.
+          - ``"error"``: raise :class:`ReconstructionWindowError`.
+          - ``"extend"``: re-fetch transactions through ``holdings.as_of_date`` and
+            return the widened container. Any ``fetch_kwargs`` (e.g.
+            ``user_account_ids``) are forwarded to :meth:`fetch_transactions`,
+            except ``start_date``/``end_date`` (driven by this method) and
+            ``limit`` (would truncate the widened range and silently drop older
+            trades) which are ignored. If the refetched window still ends before
+            the snapshot date, :class:`ReconstructionWindowError` is raised rather
+            than handing an incomplete window to reconstruction.
+
+        An unknown ``policy`` raises :class:`ValueError`. A window that already
+        reaches the snapshot date is returned unchanged.
+        """
+        # A limited fetch keeps the full date bounds while dropping older trades,
+        # so matching bounds cannot prove coverage; only an unbounded fetch whose
+        # window reaches the snapshot date is treated as complete.
+        if not limited and self._window_covers_snapshot(
+            transactions.end_date, holdings.as_of_date
+        ):
+            return transactions
+
+        if limited:
+            detail = (
+                f"transaction window was fetched with a limit, so its date bounds "
+                f"({transactions.start_date!r}..{transactions.end_date!r}) cannot "
+                f"prove coverage through holdings as_of_date "
+                f"{holdings.as_of_date!r}; reconstructed opening lots would absorb "
+                f"trades dropped by the limit"
+            )
+        else:
+            detail = (
+                f"transaction window ends {transactions.end_date!r} before holdings "
+                f"as_of_date {holdings.as_of_date!r}; reconstructed opening lots would "
+                f"absorb omitted post-range trades"
+            )
+        normalized_policy = (policy or "warn").strip().lower()
+        if normalized_policy not in {"warn", "error", "extend"}:
+            raise ValueError(
+                f"policy must be 'warn', 'error', or 'extend', not {policy!r}"
+            )
+        if normalized_policy == "error":
+            raise ReconstructionWindowError(detail)
+        if normalized_policy == "extend":
+            as_of = (holdings.as_of_date or "").strip()
+            if not as_of:
+                self.logger.warning("Cannot extend reconstruction window: %s", detail)
+                return transactions
+            self.logger.warning("Extending reconstruction window to %s: %s", as_of, detail)
+            # The date range is driven entirely by this method, so drop any
+            # caller-supplied ``start_date``/``end_date`` (they would collide with
+            # the explicit keywords below and raise a duplicate-keyword TypeError)
+            # and ``limit`` (it truncates the widened range to the newest N trades,
+            # so the returned window could reach the snapshot while silently
+            # dropping older trades reconstruction depends on).
+            extend_kwargs = {
+                key: value
+                for key, value in fetch_kwargs.items()
+                if key not in {"start_date", "end_date", "limit"}
+            }
+            extended = self.fetch_transactions(
+                start_date=transactions.start_date or None,
+                end_date=as_of,
+                **extend_kwargs,
+            )
+            # The refetch must not start later than the original window: a later
+            # start would drop the earliest trades reconstruction depends on,
+            # leaving the opening baseline to absorb them.
+            original_start = (transactions.start_date or "").strip()
+            extended_start = (extended.start_date or "").strip()
+            if original_start and extended_start > original_start:
+                raise ReconstructionWindowError(
+                    f"extended transaction window starts "
+                    f"{extended.start_date!r} after original start date "
+                    f"{transactions.start_date!r}"
+                )
+            if not self._window_covers_snapshot(extended.end_date, as_of):
+                raise ReconstructionWindowError(
+                    f"extended transaction window still ends "
+                    f"{extended.end_date!r} before holdings as_of_date {as_of!r}"
+                )
+            return extended
+        # Default: warn and leave the caller's data untouched.
+        self.logger.warning("Incomplete reconstruction window: %s", detail)
+        return transactions
 
     def fetch_histories(
         self,
