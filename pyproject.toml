@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "empower-personal-dashboard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client and CLI for Empower Personal Dashboard (formerly Personal Capital) with 2FA, session persistence, holdings, and transactions."
 readme = "README.md"
 license = "MIT"
