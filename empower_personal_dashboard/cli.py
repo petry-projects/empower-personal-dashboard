@@ -22,12 +22,15 @@ Usage:
 """
 
 import argparse
+import contextlib
 import csv
 import getpass
+import hashlib
 import json
 import logging
 import os
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -901,8 +904,25 @@ def _read_existing_transaction_records(path):
 
 
 def _earliest_transaction_date(records):
-    """Return the lexicographically earliest ISO ``transaction_date`` among records, or None."""
-    dates = [str(r.get("transaction_date")) for r in records if r.get("transaction_date")]
+    """Return the earliest canonical ``YYYY-MM-DD`` ``transaction_date``, or None.
+
+    Only strings that parse as a canonical ISO ``YYYY-MM-DD`` date are
+    considered. Missing, null, non-string, and malformed values are skipped so a
+    bad archive entry can never become the selected minimum and get forwarded as
+    an invalid ``start_date`` (``startDate``) to ``client.fetch_transactions``,
+    which would violate the CLI's ``YYYY-MM-DD`` date contract.
+    """
+    dates = []
+    for record in records:
+        value = record.get("transaction_date")
+        if not isinstance(value, str):
+            continue
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if parsed.strftime("%Y-%m-%d") == value:
+            dates.append(value)
     return min(dates) if dates else None
 
 
@@ -966,6 +986,43 @@ def _write_transactions_output(args, transactions_res, t_data, progress_file) ->
                 print(f"[+] Transactions CSV saved to: {csv_path}", file=progress_file)
 
 
+@contextlib.contextmanager
+def _archive_lock(path):
+    """Hold an exclusive advisory lock for a transaction archive.
+
+    The ``--merge`` flow reads the archive, fetches a window, merges, then
+    atomically replaces the file. ``os.replace`` makes the final swap atomic but
+    does **not** protect the surrounding read/fetch/merge/replace sequence: two
+    concurrent processes could each read the same snapshot, fetch disjoint
+    windows, and have the later replace discard the earlier process's additions
+    while both report success. Holding an exclusive ``flock`` across the whole
+    sequence serializes concurrent merges so each one operates on the prior
+    one's completed archive.
+
+    The lock lives in a dedicated file under the system temp directory, keyed by
+    a stable hash of the archive's absolute path, so it never perturbs the
+    archive directory's own contents or permissions while still giving every
+    process targeting the same archive the same lock. On platforms without
+    ``fcntl`` (e.g. Windows) locking is unavailable and the sequence proceeds
+    unserialized, best-effort.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    canonical = os.path.abspath(os.path.expanduser(str(path)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"empower-dashboard-archive-{digest}.lock"
+    with open(lock_path, "w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _load_merge_archive(args, start_date, progress_file):
     """Load the existing archive for ``--merge`` and pick the query start date.
 
@@ -1005,27 +1062,36 @@ def _merge_into_archive(args, existing_records, transactions_res, progress_file)
 def _fetch_transactions(args, client, progress_file):
     end_date = args.end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Merge mode: load any existing archive up front so the fetched window can be
-    # delta-merged into it rather than clobbering multi-year history.
-    existing_records, start_date = _load_merge_archive(args, args.start_date, progress_file)
+    # Merge mode performs a read/fetch/merge/replace sequence that is not atomic
+    # as a whole. Serialize the entire sequence under an exclusive archive lock
+    # so two concurrent merges cannot read the same snapshot and have the later
+    # os.replace silently drop the earlier process's additions. A non-merge fetch
+    # overwrites unconditionally, so it needs no lock.
+    merge_enabled = bool(getattr(args, "merge", False) and args.output_transactions)
+    lock = _archive_lock(args.output_transactions) if merge_enabled else contextlib.nullcontext()
 
-    # Beancount reconstruction requires complete transaction history, not truncated.
-    # Apply limit only for display purposes (via render functions), not the fetch.
-    tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
-    transactions_res = client.fetch_transactions(
-        start_date=start_date,
-        end_date=end_date,
-        user_account_ids=args.account_id,
-        limit=tx_limit,
-    )
+    with lock:
+        # Merge mode: load any existing archive up front so the fetched window can be
+        # delta-merged into it rather than clobbering multi-year history.
+        existing_records, start_date = _load_merge_archive(args, args.start_date, progress_file)
 
-    if existing_records:
-        transactions_res = _merge_into_archive(args, existing_records, transactions_res, progress_file)
+        # Beancount reconstruction requires complete transaction history, not truncated.
+        # Apply limit only for display purposes (via render functions), not the fetch.
+        tx_limit = None if (args.beancount or args.format == "beancount") else args.limit
+        transactions_res = client.fetch_transactions(
+            start_date=start_date,
+            end_date=end_date,
+            user_account_ids=args.account_id,
+            limit=tx_limit,
+        )
 
-    t_data = transactions_res.to_dict()
-    t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
+        if existing_records:
+            transactions_res = _merge_into_archive(args, existing_records, transactions_res, progress_file)
 
-    _write_transactions_output(args, transactions_res, t_data, progress_file)
+        t_data = transactions_res.to_dict()
+        t_data["extracted_at"] = datetime.now(timezone.utc).isoformat()
+
+        _write_transactions_output(args, transactions_res, t_data, progress_file)
     return transactions_res
 
 

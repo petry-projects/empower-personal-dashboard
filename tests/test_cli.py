@@ -14,6 +14,12 @@ from unittest.mock import patch, MagicMock
 
 from empower_personal_dashboard.cli import main as cli_main
 
+try:
+    import fcntl as _fcntl  # noqa: F401  (POSIX-only advisory locking)
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
 
 class TestCLI(unittest.TestCase):
     def test_cli_sandbox_all_with_csv(self):
@@ -571,6 +577,78 @@ class TestCliMerge(unittest.TestCase):
             _, kwargs = mock_txs.call_args
             self.assertEqual(kwargs.get("start_date"), "2025-01-01")
 
+    def test_earliest_transaction_date_ignores_invalid_dates(self):
+        # Only canonical YYYY-MM-DD strings may be selected: non-string, null,
+        # missing, and malformed values must never become the merge start date.
+        from empower_personal_dashboard.cli import _earliest_transaction_date
+
+        self.assertIsNone(_earliest_transaction_date([]))
+        self.assertIsNone(
+            _earliest_transaction_date([
+                {"transaction_date": None},
+                {"transaction_date": 20200115},          # non-string
+                {"transaction_date": "not-a-date"},        # malformed
+                {"transaction_date": "2020-13-01"},        # out-of-range month
+                {"transaction_date": "2020-1-5"},          # non-canonical padding
+                {"transaction_date": "2020-01-15T00:00"},  # extra time component
+                {},                                        # missing key
+            ])
+        )
+        # A single valid date surrounded by junk is still selected cleanly.
+        self.assertEqual(
+            _earliest_transaction_date([
+                {"transaction_date": 20200101},
+                {"transaction_date": "2021-06-10"},
+                {"transaction_date": "garbage"},
+                {"transaction_date": "2020-07-04"},
+            ]),
+            "2020-07-04",
+        )
+
+    @patch("empower_personal_dashboard.cli.EmpowerDashboardClient.fetch_transactions")
+    def test_merge_skips_invalid_archive_date_for_start(self, mock_txs):
+        # A malformed/non-string archived date must not be forwarded as start_date;
+        # the earliest *valid* canonical date is queried instead.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            out.write_text(
+                json.dumps({"user_transaction_id": "BAD", "transaction_date": "garbage", "amount": 1.0}) + "\n"
+                + json.dumps({"user_transaction_id": "OLD1", "transaction_date": "2021-06-10", "amount": 10.0}) + "\n",
+                encoding="utf-8",
+            )
+            mock_txs.return_value = self._mk_result([])
+
+            code, err = self._run_merge(out)
+            self.assertEqual(code, 0, err)
+            _, kwargs = mock_txs.call_args
+            self.assertEqual(kwargs.get("start_date"), "2021-06-10")
+
+    @unittest.skipUnless(_HAS_FCNTL, "fcntl advisory locking is only available on POSIX platforms")
+    def test_archive_lock_is_exclusive(self):
+        # The merge sequence holds an exclusive archive lock for its whole
+        # duration: while it is held, a second exclusive acquisition of the same
+        # lock file must fail rather than proceed concurrently.
+        import fcntl
+        import hashlib
+        from empower_personal_dashboard.cli import _archive_lock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "transactions.jsonl"
+            canonical = os.path.abspath(os.path.expanduser(str(out)))
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            lock_path = Path(tempfile.gettempdir()) / f"empower-dashboard-archive-{digest}.lock"
+
+            with _archive_lock(out):
+                self.assertTrue(lock_path.exists())
+                # The archive directory itself stays pristine — the lock lives elsewhere.
+                self.assertEqual([p.name for p in Path(tmpdir).iterdir()], [])
+                with open(lock_path, "w", encoding="utf-8") as other:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Once released, the lock can be re-acquired without blocking.
+            with open(lock_path, "w", encoding="utf-8") as reacquire:
+                fcntl.flock(reacquire.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(reacquire.fileno(), fcntl.LOCK_UN)
 
     def _run_merge(self, out, extra_args=()):
         argv = [
