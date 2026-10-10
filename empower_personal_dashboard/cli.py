@@ -25,12 +25,10 @@ import argparse
 import contextlib
 import csv
 import getpass
-import hashlib
 import json
 import logging
 import os
 import sys
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -999,12 +997,16 @@ def _archive_lock(path):
     sequence serializes concurrent merges so each one operates on the prior
     one's completed archive.
 
-    The lock lives in a dedicated file under the system temp directory, keyed by
-    a stable hash of the archive's absolute path, so it never perturbs the
-    archive directory's own contents or permissions while still giving every
-    process targeting the same archive the same lock. On platforms without
-    ``fcntl`` (e.g. Windows) locking is unavailable and the sequence proceeds
-    unserialized, best-effort.
+    The lock is taken on the archive's own directory, not on a separate lock
+    file. The archive itself cannot carry it (each merge replaces the file, so
+    its inode changes), while the directory is the same object for every
+    process whatever its ``TMPDIR`` — a cron job and an interactive shell
+    contend on the same lock — and nothing is created in a shared temp
+    directory under a predictable name.
+
+    Locking is best-effort: without ``fcntl`` (e.g. Windows), before the
+    directory exists (nothing to race on yet), or on a filesystem that does not
+    support ``flock``, the sequence proceeds unserialized.
     """
     try:
         import fcntl
@@ -1012,15 +1014,21 @@ def _archive_lock(path):
         yield
         return
 
-    canonical = os.path.abspath(os.path.expanduser(str(path)))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    lock_path = Path(tempfile.gettempdir()) / f"empower-dashboard-archive-{digest}.lock"
-    with open(lock_path, "w", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    directory = os.path.dirname(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        yield
+        return
+    try:
         try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        # Closing the descriptor releases the lock.
+        os.close(fd)
 
 
 def _load_merge_archive(args, start_date, progress_file):

@@ -14,13 +14,6 @@ from unittest.mock import patch, MagicMock
 
 from empower_personal_dashboard.cli import main as cli_main
 
-try:
-    import fcntl as _fcntl  # noqa: F401  (POSIX-only advisory locking)
-    _HAS_FCNTL = True
-except ImportError:
-    _HAS_FCNTL = False
-
-
 class TestCLI(unittest.TestCase):
     def test_cli_sandbox_all_with_csv(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -623,32 +616,47 @@ class TestCliMerge(unittest.TestCase):
             _, kwargs = mock_txs.call_args
             self.assertEqual(kwargs.get("start_date"), "2021-06-10")
 
-    @unittest.skipUnless(_HAS_FCNTL, "fcntl advisory locking is only available on POSIX platforms")
     def test_archive_lock_is_exclusive(self):
-        # The merge sequence holds an exclusive archive lock for its whole
-        # duration: while it is held, a second exclusive acquisition of the same
-        # lock file must fail rather than proceed concurrently.
-        import fcntl
-        import hashlib
+        # The merge holds an exclusive lock on the archive's directory for its
+        # whole read/fetch/merge/replace sequence. Locking the directory itself
+        # means every process targeting the archive contends on the same lock
+        # whatever its TMPDIR, and no lock file is created anywhere.
         from empower_personal_dashboard.cli import _archive_lock
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / "transactions.jsonl"
-            canonical = os.path.abspath(os.path.expanduser(str(out)))
-            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-            lock_path = Path(tempfile.gettempdir()) / f"empower-dashboard-archive-{digest}.lock"
+            try:
+                import fcntl
+            except ImportError:
+                # No advisory locking on this platform: the manager is a no-op.
+                with _archive_lock(out):
+                    pass
+                return
+
+            def try_lock():
+                fd = os.open(tmpdir, os.O_RDONLY)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
 
             with _archive_lock(out):
-                self.assertTrue(lock_path.exists())
-                # The archive directory itself stays pristine — the lock lives elsewhere.
-                self.assertEqual([p.name for p in Path(tmpdir).iterdir()], [])
-                with open(lock_path, "w", encoding="utf-8") as other:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # Once released, the lock can be re-acquired without blocking.
-            with open(lock_path, "w", encoding="utf-8") as reacquire:
-                fcntl.flock(reacquire.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(reacquire.fileno(), fcntl.LOCK_UN)
+                self.assertEqual(list(Path(tmpdir).iterdir()), [])
+                with self.assertRaises(BlockingIOError):
+                    try_lock()
+            # Released on exit: the same lock can be taken again.
+            try_lock()
+
+    def test_archive_lock_tolerates_missing_directory(self):
+        # A first run into a directory that does not exist yet has no archive to
+        # race on; the lock must not fail or create anything.
+        from empower_personal_dashboard.cli import _archive_lock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "not-created-yet" / "transactions.jsonl"
+            with _archive_lock(out):
+                pass
+            self.assertEqual(list(Path(tmpdir).iterdir()), [])
 
     def _run_merge(self, out, extra_args=()):
         argv = [
