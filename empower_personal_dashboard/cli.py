@@ -673,11 +673,11 @@ def _atomic_write(out_path: Path, write_body) -> None:
     The temp file is created with an exclusive ``open``, so the OS applies the
     process umask exactly as it would for a direct write: a new file gets the
     umask default without the umask ever being read or changed. An existing
-    file keeps its permission bits, and they are applied to the still-empty
+    file keeps its owner permission bits only, applied to the still-empty
     temp file before any content is written, so an owner-only archive is never
     staged in a more widely readable file.
     """
-    existing_mode = out_path.stat().st_mode & 0o777 if out_path.exists() else None
+    existing_mode = out_path.stat().st_mode & 0o700 if out_path.exists() else None
     tmp_file = out_path.parent / f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     replaced = False
     try:
@@ -1049,7 +1049,8 @@ def _load_merge_archive(args, start_date, progress_file):
     if not (getattr(args, "merge", False) and args.output_transactions):
         return None, start_date
     try:
-        existing_records = _read_existing_transaction_records(args.output_transactions)
+        validated_path = _safe_output_path(args.output_transactions)
+        existing_records = _read_existing_transaction_records(validated_path)
     except _ArchiveReadError as e:
         print(f"[!] Cannot merge: {e} The archive was left unchanged.", file=sys.stderr)
         raise _CliExit(1)
@@ -1084,7 +1085,13 @@ def _fetch_transactions(args, client, progress_file):
     # os.replace silently drop the earlier process's additions. A non-merge fetch
     # overwrites unconditionally, so it needs no lock.
     merge_enabled = bool(getattr(args, "merge", False) and args.output_transactions)
-    lock = _archive_lock(args.output_transactions) if merge_enabled else contextlib.nullcontext()
+    # Validate the output path before acquiring the lock to prevent path traversal attacks.
+    validated_output_path = (
+        _safe_output_path(args.output_transactions) if merge_enabled else None
+    )
+    lock = (
+        _archive_lock(validated_output_path) if merge_enabled else contextlib.nullcontext()
+    )
 
     with lock:
         # Merge mode: load any existing archive up front so the fetched window can be
