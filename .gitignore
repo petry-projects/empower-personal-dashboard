@@ -142,7 +142,6 @@ secring.*
 !*.crt
 !ca.crt
 !*.cert
-!*.cer
 # NOTE: *.pem / *.key have HIGH false-positive rates (TLS test fixtures, JWT
 # libraries, webpack dev certs). Per-repo .gitignores should `!` specific
 # fixture FILES — never negate a whole directory.
