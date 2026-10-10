@@ -44,6 +44,51 @@ class TestClientSessionPersistence(unittest.TestCase):
             self.assertEqual(new_client.csrf, "test-csrf-token-abc")
             self.assertEqual(new_client.session.cookies.get("JSESSIONID"), "cookie-12345")
 
+    def test_save_session_rejects_symlinked_target(self):
+        # A user-/LLM-supplied session path that is a symlink could redirect the
+        # write outside the intended location (path traversal, SonarCloud S2083).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real = Path(tmpdir) / "real_session.json"
+            real.write_text("{}", encoding="utf-8")
+            link = Path(tmpdir) / "link_session.json"
+            link.symlink_to(real)
+            client = EmpowerDashboardClient(session_file=Path(tmpdir) / "x.json", mock_mode=True)
+            with self.assertRaises(ValueError):
+                client.save_session(link)
+
+    def test_save_session_rejects_nul_byte_path(self):
+        client = EmpowerDashboardClient(mock_mode=True)
+        with self.assertRaises(ValueError):
+            client.save_session("/tmp/bad\x00name.json")
+
+    def test_setup_logging_rejects_symlinked_log_file(self):
+        import logging as _logging
+
+        # `_setup_logging` only configures handlers when none are attached yet;
+        # the logger is a process-wide singleton, so clear it to force the guard
+        # to run regardless of test ordering.
+        logger = _logging.getLogger("EmpowerDashboardClient")
+        saved_handlers = logger.handlers[:]
+        saved_level = logger.level
+        for h in saved_handlers:
+            logger.removeHandler(h)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                real = Path(tmpdir) / "real.log"
+                real.write_text("", encoding="utf-8")
+                link = Path(tmpdir) / "link.log"
+                link.symlink_to(real)
+                with self.assertRaises(ValueError):
+                    EmpowerDashboardClient(log_file=link, mock_mode=True)
+        finally:
+            for h in logger.handlers[:]:
+                logger.removeHandler(h)
+            for h in saved_handlers:
+                logger.addHandler(h)
+            # `_setup_logging` mutates the process-wide logger level; restore it so
+            # this test does not alter shared logging state for later tests.
+            logger.setLevel(saved_level)
+
     def test_saved_cookies_are_list_of_attribute_dicts(self):
         # The new on-disk format serializes cookies as a list of attribute
         # dicts (not a flattened {name: value} map), bumping the version to 2.
@@ -305,6 +350,35 @@ class TestClientAuthentication(unittest.TestCase):
             self.client.login("user@example.com", "password")
 
         self.assertIn("empower-retirement.com", self.client.base_url)
+
+    @patch("empower_personal_dashboard.client.requests.Session")
+    def test_get_csrf_from_homepage_uses_isolated_session(self, mock_session_cls):
+        # An already-authenticated client carries an active JSESSIONID. Scraping
+        # the homepage for a fresh CSRF token must not clobber that cookie with
+        # the unauthenticated JSESSIONID the login landing page emits (issue #53).
+        authed_jsessionid = "authenticated-jsessionid"
+        self.client.session.cookies.set("JSESSIONID", authed_jsessionid)
+        # Guard: the active authenticated session must never be used to scrape.
+        self.client.session.get = MagicMock(
+            side_effect=AssertionError("active session must not be used for CSRF scrape")
+        )
+
+        scratch_session = MagicMock()
+        scratch_resp = MagicMock()
+        scratch_resp.text = "<html>window.csrf = 'scraped-csrf';</html>"
+        scratch_session.get.return_value = scratch_resp
+        scratch_session.__enter__.return_value = scratch_session
+        scratch_session.__exit__.return_value = False
+        mock_session_cls.return_value = scratch_session
+
+        token = self.client._get_csrf_from_homepage()
+
+        self.assertEqual(token, "scraped-csrf")
+        # A fresh, throwaway session was constructed for the scrape.
+        mock_session_cls.assert_called_once_with()
+        scratch_session.get.assert_called_once()
+        # The active authenticated cookie survived the scrape untouched.
+        self.assertEqual(self.client.session.cookies.get("JSESSIONID"), authed_jsessionid)
 
     @patch("requests.Session.post")
     def test_request_2fa_challenge_sms(self, mock_post):
