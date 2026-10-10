@@ -1575,25 +1575,18 @@ class BeancountGenerator:
             pass
         lines.append(f'{reconciliation_date} * "{payee_esc}" "{narration_esc}"\n')
         lines.append(f'  empower_holding: "{holding_tag}"\n')
-        # Derive the USD leg from the *formatted* quantity and price actually
-        # emitted on the posting below (six- and four-decimal rounding). Computing
-        # it from the raw inputs can disagree with the rounded posting by cents
-        # (e.g. 10,000 units @ $12.34567), leaving the transaction unbalanced.
-        equity_amount = (
-            round(float(_format_quantity(surplus)) * float(_format_price(price)), 2)
-            if price > 0
-            else 0.0
+        # Reduce the opening lot with an empty cost spec ``{}`` so the reduction
+        # applies to the *costed* lot that ``_append_snapshot_lot`` emits when the
+        # ticker had a sale in the window (``force_cost``). A bare ``@ price``
+        # posting without ``{}`` books a separate uncosted leg, leaving two lots
+        # (e.g. ``10 GE {12 USD}`` and an uncosted ``-5 GE``): the unit assertion
+        # still passes but the cost basis is wrong. Keep the ``@ price`` annotation
+        # when priced and let the equity leg auto-balance at the booked cost.
+        price_str = f" @ {_format_price(price)} USD" if price > 0 else ""
+        lines.append(
+            f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}{price_str}\n"
         )
-        if equity_amount > 0:
-            lines.append(
-                f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} @ {_format_price(price)} USD\n"
-            )
-            lines.append(f"  {ACCT_OPENING_BALANCES:<36} {equity_amount:>8.2f} USD\n\n")
-        else:
-            lines.append(
-                f"  {b_account:<36} -{_format_quantity(surplus)} {ticker} {{}}\n"
-            )
-            lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
+        lines.append(f"  {ACCT_OPENING_BALANCES:<36}\n\n")
 
     def _append_snapshot_lot(
         self,

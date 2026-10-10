@@ -987,6 +987,60 @@ class TestReconstructionWindowGuard(unittest.TestCase):
                     transactions, holdings, policy="extend",
                 )
 
+    def test_limited_window_with_covering_dates_is_not_complete(self):
+        # A limited fetch keeps the full date bounds while dropping older trades,
+        # so matching bounds must not short-circuit as complete.
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        client = self._client()
+        with self.assertLogs("EmpowerDashboardClient", level="WARNING") as cm:
+            result = client.reconcile_transaction_window(
+                transactions, holdings, limited=True,
+            )
+        self.assertIs(result, transactions)
+        self.assertTrue(any("limit" in m.lower() for m in cm.output))
+
+    def test_limited_window_error_policy_raises(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings = DashboardHoldings(
+            as_of_date="2024-10-01", total_value=100.0,
+            holdings=[{"ticker": "VTI", "quantity": 1.0, "price": 100.0}],
+        )
+        transactions = DashboardTransactions(
+            start_date="2024-01-01", end_date="2024-10-01", total_transactions=0,
+            money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+        )
+        client = self._client()
+        with self.assertRaises(ReconstructionWindowError):
+            client.reconcile_transaction_window(
+                transactions, holdings, policy="error", limited=True,
+            )
+
+    def test_extend_rejects_window_starting_after_original(self):
+        from empower_personal_dashboard.exceptions import ReconstructionWindowError
+        holdings, transactions = self._incomplete()
+        client = self._client()
+
+        def fake_fetch(**kwargs):
+            # Refetch covers the snapshot end but starts later than the original
+            # window, dropping the earliest trades.
+            return DashboardTransactions(
+                start_date="2024-03-01", end_date="2024-10-01", total_transactions=0,
+                money_in=0.0, money_out=0.0, net_cashflow=0.0, transactions=[],
+            )
+
+        with patch.object(client, "fetch_transactions", side_effect=fake_fetch):
+            with self.assertRaises(ReconstructionWindowError):
+                client.reconcile_transaction_window(
+                    transactions, holdings, policy="extend",
+                )
+
     def test_extend_drops_limit_and_date_kwargs(self):
         holdings, transactions = self._incomplete()
         client = self._client()

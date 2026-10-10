@@ -867,6 +867,7 @@ class EmpowerDashboardClient:
         transactions: DashboardTransactions,
         holdings: DashboardHoldings,
         policy: str = "warn",
+        limited: bool = False,
         **fetch_kwargs: Any,
     ) -> DashboardTransactions:
         """Guard the Beancount reconstruction window against a short transaction range.
@@ -876,6 +877,12 @@ class EmpowerDashboardClient:
         range ends before ``holdings.as_of_date``, trades after the range are
         omitted and the baseline silently absorbs them, so the reconstructed
         opening lots are wrong.
+
+        ``limited`` records whether ``transactions`` came from a capped fetch
+        (``fetch_transactions(limit=...)``). A limited fetch drops older trades
+        while keeping the full response date bounds, so matching bounds are *not*
+        proof of coverage: the window is treated as incomplete regardless of its
+        end date, and the ``policy`` below is applied.
 
         Contract (``policy``):
           - ``"warn"`` (default): log a warning and return ``transactions`` unchanged.
@@ -892,14 +899,28 @@ class EmpowerDashboardClient:
         An unknown ``policy`` raises :class:`ValueError`. A window that already
         reaches the snapshot date is returned unchanged.
         """
-        if self._window_covers_snapshot(transactions.end_date, holdings.as_of_date):
+        # A limited fetch keeps the full date bounds while dropping older trades,
+        # so matching bounds cannot prove coverage; only an unbounded fetch whose
+        # window reaches the snapshot date is treated as complete.
+        if not limited and self._window_covers_snapshot(
+            transactions.end_date, holdings.as_of_date
+        ):
             return transactions
 
-        detail = (
-            f"transaction window ends {transactions.end_date!r} before holdings "
-            f"as_of_date {holdings.as_of_date!r}; reconstructed opening lots would "
-            f"absorb omitted post-range trades"
-        )
+        if limited:
+            detail = (
+                f"transaction window was fetched with a limit, so its date bounds "
+                f"({transactions.start_date!r}..{transactions.end_date!r}) cannot "
+                f"prove coverage through holdings as_of_date "
+                f"{holdings.as_of_date!r}; reconstructed opening lots would absorb "
+                f"trades dropped by the limit"
+            )
+        else:
+            detail = (
+                f"transaction window ends {transactions.end_date!r} before holdings "
+                f"as_of_date {holdings.as_of_date!r}; reconstructed opening lots would "
+                f"absorb omitted post-range trades"
+            )
         normalized_policy = (policy or "warn").strip().lower()
         if normalized_policy not in {"warn", "error", "extend"}:
             raise ValueError(
@@ -929,6 +950,17 @@ class EmpowerDashboardClient:
                 end_date=as_of,
                 **extend_kwargs,
             )
+            # The refetch must not start later than the original window: a later
+            # start would drop the earliest trades reconstruction depends on,
+            # leaving the opening baseline to absorb them.
+            original_start = (transactions.start_date or "").strip()
+            extended_start = (extended.start_date or "").strip()
+            if original_start and extended_start > original_start:
+                raise ReconstructionWindowError(
+                    f"extended transaction window starts "
+                    f"{extended.start_date!r} after original start date "
+                    f"{transactions.start_date!r}"
+                )
             if not self._window_covers_snapshot(extended.end_date, as_of):
                 raise ReconstructionWindowError(
                     f"extended transaction window still ends "
