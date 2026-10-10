@@ -1004,9 +1004,11 @@ def _archive_lock(path):
     contend on the same lock — and nothing is created in a shared temp
     directory under a predictable name.
 
-    Locking is best-effort: without ``fcntl`` (e.g. Windows), before the
-    directory exists (nothing to race on yet), or on a filesystem that does not
-    support ``flock``, the sequence proceeds unserialized.
+    Only a path validated by ``_safe_output_path`` is ever opened. Locking is
+    best-effort: without ``fcntl`` (e.g. Windows), for a symlinked path (which
+    the read and write steps refuse anyway), before the directory exists
+    (nothing to race on yet), or on a filesystem that does not support
+    ``flock``, the sequence proceeds unserialized.
     """
     try:
         import fcntl
@@ -1014,7 +1016,13 @@ def _archive_lock(path):
         yield
         return
 
-    directory = os.path.dirname(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        directory = _safe_output_path(Path(path)).parent
+    except ValueError:
+        # A symlinked target or parent is refused by the read and write steps
+        # themselves, each with its own message; do not open it here.
+        yield
+        return
     try:
         fd = os.open(directory, os.O_RDONLY)
     except OSError:

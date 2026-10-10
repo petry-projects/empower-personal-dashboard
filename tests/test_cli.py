@@ -647,6 +647,22 @@ class TestCliMerge(unittest.TestCase):
             # Released on exit: the same lock can be taken again.
             try_lock()
 
+    def test_archive_lock_does_not_follow_a_symlinked_directory(self):
+        # The lock only ever opens a validated path. A symlinked parent is
+        # refused by the read and write steps with their own messages, so the
+        # lock steps aside instead of opening the redirected directory.
+        from empower_personal_dashboard.cli import _archive_lock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_dir = Path(tmpdir) / "real"
+            real_dir.mkdir()
+            link_dir = Path(tmpdir) / "link"
+            link_dir.symlink_to(real_dir)
+            with patch("empower_personal_dashboard.cli.os.open") as mock_open:
+                with _archive_lock(link_dir / "transactions.jsonl"):
+                    pass
+            mock_open.assert_not_called()
+
     def test_archive_lock_tolerates_missing_directory(self):
         # A first run into a directory that does not exist yet has no archive to
         # race on; the lock must not fail or create anything.
